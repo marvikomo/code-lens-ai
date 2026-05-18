@@ -330,7 +330,7 @@ function analyzeFile(
       bufferSize: Math.max(source.length + 1024, 32 * 1024),
     });
   } catch (err) {
-    console.warn(`[ast-graph] parse failed for ${filePath}: ${(err as Error).message}`);
+    console.warn(`[codelens] parse failed for ${filePath}: ${(err as Error).message}`);
     return;
   }
 

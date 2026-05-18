@@ -202,7 +202,7 @@ Every agent-written description is timestamped + the spine snapshot is captured.
 
 ```bash
 # General
-ast-graph <repo-path> [options]
+codelens <repo-path> [options]
 
 # Analysis
 --no-json              # don't emit graph JSON to stdout

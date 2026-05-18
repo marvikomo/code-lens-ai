@@ -4,7 +4,7 @@
   "description": "AST-graph code analysis with Tree-sitter and Neo4j",
   "main": "dist/cli.js",
   "bin": {
-    "ast-graph": "dist/cli.js"
+    "codelens": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc",
