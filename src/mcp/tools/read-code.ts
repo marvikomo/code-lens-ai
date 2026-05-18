@@ -29,10 +29,15 @@ export function registerReadCode(server: McpServer, ctx: ToolContext): void {
     {
       title: "Read source from a file",
       description:
-        "Read a slice of source code directly from disk. Useful when get_definition's stored body " +
-        "is truncated or you need surrounding context (imports, sibling functions, etc.). " +
-        "Pass startLine + endLine (1-indexed, inclusive) to slice; omit both to read the whole file. " +
-        "Caps output at 2000 lines per call (matches the built-in Read tool).",
+        "Read a slice of source code directly from disk via the MCP server. " +
+        "If your environment has its own filesystem read (Claude Code's `Read`, " +
+        "an editor's open-buffer access, etc.), prefer THAT — it's faster and " +
+        "doesn't require absolute paths. Use this tool when you're connecting " +
+        "to a remote MCP server with no local filesystem access, or when " +
+        "get_definition's stored body is truncated and you need the full text " +
+        "with surrounding context. Pass startLine + endLine (1-indexed, " +
+        "inclusive) to slice; omit both to read the whole file. " +
+        "Caps output at 2000 lines per call (matches Claude Code's `Read` cap).",
       inputSchema: readCodeSchema,
     },
     async ({ file, startLine, endLine }) => {

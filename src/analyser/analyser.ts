@@ -5,6 +5,7 @@ import {
   GraphNode,
   CodeGraph,
   NodeKind,
+  EdgeSource,
 } from "../util/graph";
 import { detectLanguage, SupportedLanguage } from "../util/language";
 import { getParser } from "./../util/parserFactory";
@@ -68,13 +69,17 @@ export function analyzeRepository(
   const ignores = new Set([...DEFAULT_IGNORES, ...(opts.ignore ?? [])]);
   const builder = new GraphBuilder();
 
-  // Repository node.
+  // Repository node. lastIndexed stamped at extract time so the standard
+  // (`--neo4j-clear --cluster`) flow surfaces a freshness signal, not just
+  // the incremental flow. Incremental's setRepositoryMeta will overwrite
+  // with a fractionally-newer write-time timestamp — also fine.
   const repoName = path.basename(absRepo);
   const repoNode = builder.addNode({
     id: `repo:${absRepo}`,
     kind: "Repository",
     name: repoName,
     path: absRepo,
+    lastIndexed: new Date().toISOString(),
   });
 
   // Walk filesystem.  Track folder→nodeId map so we can wire CONTAINS edges.
@@ -215,6 +220,11 @@ export function analyzeIncremental(
     kind: "Repository",
     name: path.basename(absRepo),
     path: absRepo,
+    // analyzeIncremental's caller (cli.runIncremental) overrides this via
+    // setRepositoryMeta after the write — so the eventual stored timestamp
+    // matches write time. Setting here ensures cold/non-incremental flows
+    // also get a usable freshness signal.
+    lastIndexed: opts.indexedAt,
   });
 
   const pendingImports: ExtractContext["pendingImports"] = [];
@@ -378,6 +388,23 @@ function resolveImports(
         from: fromNode.id,
         to: targetFile.id,
       });
+      if (imp.reexport?.kind === "named") {
+        builder.addEdge({
+          kind: "REEXPORTS",
+          from: fromNode.id,
+          to: targetFile.id,
+          meta: {
+            localName: imp.reexport.localName,
+            exportedName: imp.reexport.exportedName,
+          },
+        });
+      } else if (imp.reexport?.kind === "all") {
+        builder.addEdge({
+          kind: "REEXPORTS_ALL",
+          from: fromNode.id,
+          to: targetFile.id,
+        });
+      }
     } else {
       builder.addEdge({
         kind: "IMPORTS",
@@ -385,6 +412,25 @@ function resolveImports(
         to: `unresolved:module:${imp.spec}`,
         unresolved: imp.spec,
       });
+      if (imp.reexport?.kind === "named") {
+        builder.addEdge({
+          kind: "REEXPORTS",
+          from: fromNode.id,
+          to: `unresolved:module:${imp.spec}`,
+          unresolved: imp.spec,
+          meta: {
+            localName: imp.reexport.localName,
+            exportedName: imp.reexport.exportedName,
+          },
+        });
+      } else if (imp.reexport?.kind === "all") {
+        builder.addEdge({
+          kind: "REEXPORTS_ALL",
+          from: fromNode.id,
+          to: `unresolved:module:${imp.spec}`,
+          unresolved: imp.spec,
+        });
+      }
     }
   }
 }
@@ -444,12 +490,19 @@ function resolveSpec(
 interface ImportExportIndex {
   fileImports: Map<string, Set<string>>;
   exportsByFileAndName: Map<string, GraphNode>;
+  reexportsByFileAndName: Map<string, { fileId: string; localName: string }[]>;
+  reexportAllByFile: Map<string, Set<string>>;
 }
 
 function buildImportExportIndex(builder: GraphBuilder): ImportExportIndex {
   const graph = builder.build();
   const fileImports = new Map<string, Set<string>>();
   const exportsByFileAndName = new Map<string, GraphNode>();
+  const reexportsByFileAndName = new Map<
+    string,
+    { fileId: string; localName: string }[]
+  >();
+  const reexportAllByFile = new Map<string, Set<string>>();
 
   for (const e of graph.edges) {
     if (e.kind === "IMPORTS") {
@@ -469,10 +522,84 @@ function buildImportExportIndex(builder: GraphBuilder): ImportExportIndex {
       const target = builder.getNode(e.to);
       if (!target) continue;
       exportsByFileAndName.set(`${e.from}|${exportedName}`, target);
+    } else if (e.kind === "REEXPORTS") {
+      const targetFile = builder.getNode(e.to);
+      if (targetFile?.kind !== "File") continue;
+      const localName = e.meta?.localName as string | undefined;
+      const exportedName = e.meta?.exportedName as string | undefined;
+      if (!localName || !exportedName) continue;
+      const key = `${e.from}|${exportedName}`;
+      const arr = reexportsByFileAndName.get(key) ?? [];
+      arr.push({ fileId: e.to, localName });
+      reexportsByFileAndName.set(key, arr);
+    } else if (e.kind === "REEXPORTS_ALL") {
+      const targetFile = builder.getNode(e.to);
+      if (targetFile?.kind !== "File") continue;
+      const set = reexportAllByFile.get(e.from) ?? new Set<string>();
+      set.add(e.to);
+      reexportAllByFile.set(e.from, set);
     }
   }
 
-  return { fileImports, exportsByFileAndName };
+  return {
+    fileImports,
+    exportsByFileAndName,
+    reexportsByFileAndName,
+    reexportAllByFile,
+  };
+}
+
+interface FollowResult {
+  target: GraphNode;
+  source: EdgeSource;
+}
+
+function followExportFromFile(
+  index: ImportExportIndex,
+  fileId: string,
+  name: string,
+  kindFilter: ReadonlySet<NodeKind>,
+  visited = new Set<string>(),
+): FollowResult | null {
+  const visitKey = `${fileId}|${name}`;
+  if (visited.has(visitKey)) return null;
+  visited.add(visitKey);
+
+  const direct = index.exportsByFileAndName.get(`${fileId}|${name}`);
+  if (direct && kindFilter.has(direct.kind)) {
+    return { target: direct, source: "via_imports" };
+  }
+
+  const named = index.reexportsByFileAndName.get(`${fileId}|${name}`) ?? [];
+  const matches: FollowResult[] = [];
+  for (const reexport of named) {
+    const result = followExportFromFile(
+      index,
+      reexport.fileId,
+      reexport.localName,
+      kindFilter,
+      new Set(visited),
+    );
+    if (result) matches.push({ target: result.target, source: "via_reexport" });
+  }
+
+  const starFiles = index.reexportAllByFile.get(fileId);
+  if (starFiles) {
+    for (const reexportedFileId of starFiles) {
+      const result = followExportFromFile(
+        index,
+        reexportedFileId,
+        name,
+        kindFilter,
+        new Set(visited),
+      );
+      if (result) matches.push({ target: result.target, source: "via_reexport" });
+    }
+  }
+
+  const unique = new Map<string, FollowResult>();
+  for (const match of matches) keepBestFollowResult(unique, match);
+  return unique.size === 1 ? [...unique.values()][0] : null;
 }
 
 /**
@@ -491,17 +618,49 @@ function followViaImports(
   callerFileId: string,
   name: string,
   kindFilter: ReadonlySet<NodeKind>,
-): GraphNode | null {
+): FollowResult | null {
   const importedFiles = index.fileImports.get(callerFileId);
   if (!importedFiles) return null;
-  const matches: GraphNode[] = [];
+  const matches: FollowResult[] = [];
   for (const importedFileId of importedFiles) {
-    const target = index.exportsByFileAndName.get(`${importedFileId}|${name}`);
-    if (target && kindFilter.has(target.kind)) matches.push(target);
+    const result = followExportFromFile(
+      index,
+      importedFileId,
+      name,
+      kindFilter,
+    );
+    if (result) matches.push(result);
   }
   // Single unique match wins. Multiple matches → ambiguous, fall back to
   // caller's other heuristics rather than guessing here.
-  return matches.length === 1 ? matches[0] : null;
+  const unique = new Map<string, FollowResult>();
+  for (const match of matches) keepBestFollowResult(unique, match);
+  return unique.size === 1 ? [...unique.values()][0] : null;
+}
+
+function keepBestFollowResult(
+  byTargetId: Map<string, FollowResult>,
+  next: FollowResult,
+): void {
+  const existing = byTargetId.get(next.target.id);
+  if (!existing || confidenceRank(next.source) < confidenceRank(existing.source)) {
+    byTargetId.set(next.target.id, next);
+  }
+}
+
+function confidenceRank(source: EdgeSource): number {
+  switch (source) {
+    case "static":
+      return 0;
+    case "via_imports":
+      return 1;
+    case "via_reexport":
+      return 2;
+    case "name_only":
+      return 3;
+    case "dynamic":
+      return 4;
+  }
 }
 
 const CALLABLE_KINDS: ReadonlySet<NodeKind> = new Set(["Function", "Method"]);
@@ -524,8 +683,6 @@ function resolveCallsByName(builder: GraphBuilder): void {
   for (const edge of graph.edges) {
     if (edge.kind !== "CALLS") continue;
     if (!edge.unresolved) continue;
-    const candidates = byName.get(edge.unresolved);
-    if (!candidates || candidates.length === 0) continue;
 
     const fromNode = builder.getNode(edge.from);
     const callerFileId = fromNode?.path ? `file:${fromNode.path}` : null;
@@ -535,6 +692,7 @@ function resolveCallsByName(builder: GraphBuilder): void {
     // candidate. (1) wins because the caller's import statement is the
     // strongest signal of which same-named function it actually meant.
     let target: GraphNode | undefined;
+    let source: EdgeSource = "name_only";
     if (callerFileId) {
       const viaImports = followViaImports(
         ieIndex,
@@ -542,15 +700,22 @@ function resolveCallsByName(builder: GraphBuilder): void {
         edge.unresolved,
         CALLABLE_KINDS,
       );
-      if (viaImports) target = viaImports;
+      if (viaImports) {
+        target = viaImports.target;
+        source = viaImports.source;
+      }
     }
+    const candidates = byName.get(edge.unresolved);
+    if (!target && (!candidates || candidates.length === 0)) continue;
     if (!target && fromNode?.path) {
-      target = candidates.find((c) => c.path === fromNode.path);
+      target = candidates!.find((c) => c.path === fromNode.path);
+      if (target) source = "static";
     }
-    if (!target) target = candidates[0];
+    if (!target) target = candidates![0];
 
     const oldTo = edge.to;
     edge.to = target.id;
+    edge.source = source;
     delete edge.unresolved;
     edge.id = `${edge.kind}:${edge.from}->${edge.to}`;
     builder.rekeyEdge(edge.from, oldTo, edge.kind, edge);
@@ -624,6 +789,29 @@ function resolveTypeRefsByName(builder: GraphBuilder): void {
     const simpleName = normalizeTypeRef(edge.unresolved);
     if (!simpleName) continue;
 
+    const fromNode = builder.getNode(edge.from);
+    const sourceFileId = fromNode?.path ? `file:${fromNode.path}` : null;
+
+    // Phase 1 preference: (1) IMPORTS→EXPORTS match wins; (2) any-IMPORTS
+    // disambiguation (older heuristic — caller imports from the candidate's
+    // file, regardless of whether that file actually exports this name);
+    // (3) unique candidate; (4) leave unresolved on ambiguity.
+    let target: GraphNode | undefined;
+    let source: EdgeSource = "name_only";
+    const filterKinds =
+      edge.kind === "IMPLEMENTS" ? INTERFACE_ONLY : CLASS_OR_INTERFACE;
+    if (sourceFileId) {
+      const viaImports = followViaImports(
+        ieIndex,
+        sourceFileId,
+        simpleName,
+        filterKinds,
+      );
+      if (viaImports) {
+        target = viaImports.target;
+        source = viaImports.source;
+      }
+    }
     let candidates =
       edge.kind === "IMPLEMENTS"
         ? interfaceByName.get(simpleName)
@@ -635,26 +823,10 @@ function resolveTypeRefsByName(builder: GraphBuilder): void {
     ) {
       candidates = interfaceByName.get(simpleName);
     }
-    if (!candidates || candidates.length === 0) continue;
-
-    const fromNode = builder.getNode(edge.from);
-    const sourceFileId = fromNode?.path ? `file:${fromNode.path}` : null;
-
-    // Phase 1 preference: (1) IMPORTS→EXPORTS match wins; (2) any-IMPORTS
-    // disambiguation (older heuristic — caller imports from the candidate's
-    // file, regardless of whether that file actually exports this name);
-    // (3) unique candidate; (4) leave unresolved on ambiguity.
-    let target: GraphNode | undefined;
-    const filterKinds =
-      edge.kind === "IMPLEMENTS" ? INTERFACE_ONLY : CLASS_OR_INTERFACE;
-    if (sourceFileId) {
-      const viaImports = followViaImports(
-        ieIndex,
-        sourceFileId,
-        simpleName,
-        filterKinds,
-      );
-      if (viaImports) target = viaImports;
+    if (!target && (!candidates || candidates.length === 0)) continue;
+    if (!target && fromNode?.path) {
+      target = candidates.find((c) => c.path === fromNode.path);
+      if (target) source = "static";
     }
     if (!target && sourceFileId && candidates.length > 1) {
       const imports = ieIndex.fileImports.get(sourceFileId);
@@ -662,13 +834,18 @@ function resolveTypeRefsByName(builder: GraphBuilder): void {
         target = candidates.find(
           (c) => c.path && imports.has(`file:${c.path}`),
         );
+        if (target) source = "via_imports";
       }
     }
-    if (!target && candidates.length === 1) target = candidates[0];
+    if (!target && candidates.length === 1) {
+      target = candidates[0];
+      if (fromNode?.path && target.path === fromNode.path) source = "static";
+    }
     if (!target) continue; // still ambiguous → safer to leave unresolved
 
     const oldTo = edge.to;
     edge.to = target.id;
+    edge.source = source;
     delete edge.unresolved;
     edge.id = `${edge.kind}:${edge.from}->${edge.to}`;
     builder.rekeyEdge(edge.from, oldTo, edge.kind, edge);

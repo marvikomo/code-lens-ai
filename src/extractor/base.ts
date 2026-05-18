@@ -8,7 +8,13 @@ export interface ExtractContext {
   filePath: string;
   language: SupportedLanguage;
   /** Pending unresolved imports: raw module specifier → list of "files we should link to". Resolved at the end. */
-  pendingImports: { from: string; spec: string }[];
+  pendingImports: {
+    from: string;
+    spec: string;
+    reexport?:
+      | { kind: "named"; localName: string; exportedName: string }
+      | { kind: "all" };
+  }[];
 }
 
 export interface LanguageExtractor {

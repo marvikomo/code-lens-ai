@@ -3,6 +3,30 @@ import type { ToolContext } from "../server";
 import { readQuery, asNumber, textResult } from "../util";
 
 /**
+ * Compact wall-clock age for an ISO timestamp ("3h ago", "2d ago", "5w ago").
+ * Returns null on missing/unparseable input. Used to surface index drift —
+ * agents shouldn't trust a stale graph for current-state questions.
+ */
+function describeAge(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return null;
+  const ms = Date.now() - ts;
+  if (ms < 0) return "just now";
+  const min = Math.floor(ms / 60_000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 14) return `${day}d ago`;
+  const wk = Math.floor(day / 7);
+  if (wk < 8) return `${wk}w ago`;
+  const mo = Math.floor(day / 30);
+  return `${mo}mo ago`;
+}
+
+/**
  * Build a freshness annotation for an agent-written community description.
  * Combines wall-clock age (from `descriptionWrittenAt`) with spine-file
  * drift (snapshot taken at write-time vs. current spine). Returns null when
@@ -95,7 +119,13 @@ export function registerGetOverview(
                   size, spinePaths, samplePaths
            ORDER BY size DESC LIMIT 12`,
         ),
-        readQuery(ctx, `MATCH (r:Repository) RETURN r.path AS path LIMIT 1`),
+        readQuery(
+          ctx,
+          `MATCH (r:Repository)
+           RETURN r.path AS path, r.lastIndexed AS lastIndexed,
+                  r.lastCommit AS lastCommit
+           LIMIT 1`,
+        ),
       ]);
 
       // Repo prefix used to render relative paths. Falls back to "" so
@@ -107,8 +137,23 @@ export function registerGetOverview(
           ? p.slice(repoPath.length).replace(/^\/+/, "")
           : p;
 
+      const lastIndexedIso =
+        (repoRows[0]?.lastIndexed as string | undefined) ?? null;
+      const lastCommit =
+        (repoRows[0]?.lastCommit as string | undefined) ?? null;
+      const indexAge = describeAge(lastIndexedIso);
+
       const out: string[] = [];
       out.push("# Codebase overview");
+      // Index-freshness signal — agents shouldn't trust a stale graph for
+      // current-state questions. Surfaces both wall-clock age and the
+      // commit indexed (so agents can compare to current HEAD if needed).
+      if (indexAge || lastCommit) {
+        const parts: string[] = [];
+        if (indexAge) parts.push(`indexed ${indexAge}`);
+        if (lastCommit) parts.push(`commit ${lastCommit.slice(0, 12)}`);
+        out.push(`> ${parts.join(" · ")}`);
+      }
       out.push("");
       out.push("## Node counts");
       for (const r of counts) {

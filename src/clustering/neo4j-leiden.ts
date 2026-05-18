@@ -176,8 +176,9 @@ export async function clusterInNeo4j(
        WHERE size >= $minSize
        MERGE (c:Community:CodeNode { id: 'community:' + toString(cid) })
          ON CREATE SET c.communityId = cid, c.size = size,
-                       c.name = 'community-' + toString(cid)
-         ON MATCH  SET c.size = size
+                       c.name = 'community-' + toString(cid),
+                       c.kind = 'Community'
+         ON MATCH  SET c.size = size, c.kind = 'Community'
        WITH c, members
        UNWIND members AS f
        MERGE (f)-[:IN_COMMUNITY]->(c)`,
