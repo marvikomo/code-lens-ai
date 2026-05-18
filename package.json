@@ -1,11 +1,16 @@
 {
-  "name": "codelens-ai",
+  "name": "@marvikomo/codelens-ai",
   "version": "1.0.0",
   "description": "AST-graph code analysis with Tree-sitter and Neo4j",
   "main": "dist/cli.js",
   "bin": {
     "codelens": "dist/cli.js"
   },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/cli.js",
@@ -16,7 +21,8 @@
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",
     "neo4j:start": "docker-compose up -d neo4j",
-    "neo4j:stop": "docker-compose stop neo4j"
+    "neo4j:stop": "docker-compose stop neo4j",
+    "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "code-analysis",

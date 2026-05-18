@@ -120,44 +120,58 @@ Claude Code, Cursor, Codex, any MCP client
 ### Prerequisites
 
 - Node.js 18+
-- Docker (for Neo4j)
+- Docker (for the bundled Neo4j container)
 
-### Setup
-
-```bash
-# Clone + install
-git clone https://github.com/marvikomo/code-lens-aI.git
-cd code-lens-aI
-npm install
-
-# Start Neo4j (with APOC + GDS plugins for clustering)
-docker compose up -d neo4j
-
-# Index a codebase + run Leiden clustering
-npm run dev -- /path/to/your/repo --no-json --neo4j-clear --cluster
-
-# (Optional) compute embeddings for semantic + hybrid search (~2-3 min, ~161 MB model)
-npm run dev -- /path/to/your/repo --no-json --embed
-```
-
-### Wire into Claude Code
+### Install + index + wire up
 
 ```bash
-claude mcp add code-lens-ai \
-  --transport stdio \
-  -e NEO4J_URI=neo4j://localhost:7687 \
-  -e NEO4J_USER=neo4j \
-  -e NEO4J_PASSWORD=password \
-  -- npx ts-node /absolute/path/to/code-lens-aI/src/cli.ts --mcp
+# Install the CLI globally
+npm install -g @marvikomo/codelens-ai
+
+# Start the bundled Neo4j (image: neo4j:5.15 with APOC + GDS plugins)
+codelens neo4j start
+
+# Index a repo + run Leiden clustering
+codelens index /path/to/your/repo \
+  --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password password \
+  --neo4j-clear --cluster
+
+# (Optional) semantic + hybrid search (downloads ~161 MB embedding model)
+codelens index /path/to/your/repo \
+  --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password password \
+  --embed
+
+# Register the MCP server with Claude Code (one-time)
+codelens mcp install --scope user \
+  --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password password
 ```
 
-Then in any Claude Code session inside the indexed project's folder:
+Then in any Claude Code session:
 
 ```
-Use code-lens-ai to give me an overview of this codebase.
+Use codelens to give me an overview of this codebase.
 ```
 
 The agent will see 10 tools (`search_code`, `get_definition`, `read_code`, `get_callers`, `get_callees`, `impact_analysis`, `get_overview`, `label_community`, `generate_wiki`, `cypher`) and decide which to use.
+
+### Day-to-day
+
+```bash
+codelens index /path/to/repo --incremental    # only re-index changed files
+codelens neo4j status                          # is the DB up?
+codelens neo4j logs                            # tail container logs
+codelens neo4j stop                            # shut down (data persists in docker volume)
+```
+
+### Development (from source)
+
+```bash
+git clone https://github.com/marvikomo/code-lens-aI.git
+cd code-lens-aI
+npm install
+npm link                       # makes `codelens` resolve to this checkout
+npm run dev -- index .         # or: ts-node src/cli.ts ...
+```
 
 ---
 
@@ -201,24 +215,39 @@ Every agent-written description is timestamped + the spine snapshot is captured.
 ## 🛠️ CLI reference
 
 ```bash
-# General
-codelens <repo-path> [options]
+codelens <subcommand> [args]
+codelens <repo-path> [options]                  # shorthand for: codelens index <path>
+```
 
-# Analysis
+### Subcommands
+
+```bash
+codelens index <path> [options]                 # analyze + index a repo
+codelens mcp                                    # run MCP server (stdio)
+codelens mcp install [options]                  # register MCP with Claude Code
+codelens neo4j start|stop|status|logs           # manage bundled Neo4j container
+codelens help                                   # show top-level help
+```
+
+### `codelens index` options
+
+```bash
+# Output
 --no-json              # don't emit graph JSON to stdout
 -o file.json           # write JSON to file
 --ignore foo,bar       # extra directory/file names to skip
 --stats                # print summary stats to stderr
 
-# Neo4j (also reads NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD env vars)
+# Neo4j (also reads NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD / NEO4J_DATABASE env vars)
 --neo4j-uri <uri>
 --neo4j-user <name>
 --neo4j-password <pw>
 --neo4j-clear          # DETACH DELETE all :CodeNode before re-indexing
+--incremental          # re-index only changed files (git-aware), cascading to dependents
 
 # Clustering (requires Neo4j GDS plugin)
 --cluster              # run Leiden + PageRank + spine selection
---cluster-only         # skip indexing; just re-cluster (preserves labels)
+--cluster-only         # skip indexing; just re-cluster
 --cluster-clear        # wipe community props + labels first
 --cluster-min-size <n> # min files to materialize a :Community node (default 3)
 
@@ -230,10 +259,22 @@ codelens <repo-path> [options]
 --search "<query>"
 --search-mode <m>      # fts | vector | hybrid (auto if omitted)
 --search-limit <n>
-
-# MCP server mode (no <repo-path> needed)
---mcp                  # stdio MCP server for Claude Code/Cursor
 ```
+
+### `codelens mcp install` options
+
+```bash
+--scope <local|user|project>   # where to register (default: local)
+                               #   local   = this directory only
+                               #   user    = available in all your projects
+                               #   project = shared via .mcp.json in repo
+--neo4j-uri <uri>              # e.g. bolt://localhost:7687
+--neo4j-user <name>
+--neo4j-password <pw>
+--neo4j-database <name>        # (optional)
+```
+
+If `--neo4j-*` flags are omitted, falls back to `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` env vars.
 
 ---
 
@@ -282,7 +323,8 @@ src/
 ├── embeddings/       # @xenova/transformers wrapper + batch pipeline
 ├── search/           # FTS, vector, hybrid (RRF) implementations
 ├── mcp/              # MCP server + 10 tool implementations
-└── cli.ts            # entry point — analysis, embeddings, clustering, search, mcp
+├── cli-commands/     # subcommand handlers (neo4j docker wrapper, mcp install)
+└── cli.ts            # entry point + subcommand dispatcher
 scripts/
 ├── mcp-smoke.ts          # end-to-end MCP smoke test (10 tools)
 ├── mcp-impact-test.ts    # impact_analysis manual harness
