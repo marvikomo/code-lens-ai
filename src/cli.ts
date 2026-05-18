@@ -166,7 +166,7 @@ function parseArgs(argv: string[]): CliArgs {
         const v = argv[++i];
         if (v !== "fts" && v !== "vector" && v !== "hybrid") {
           console.error(
-            `[ast-graph] --search-mode must be one of: fts, vector, hybrid (got "${v}")`,
+            `[codelens] --search-mode must be one of: fts, vector, hybrid (got "${v}")`,
           );
           process.exit(2);
         }
@@ -205,10 +205,10 @@ function parseArgs(argv: string[]): CliArgs {
 
 function printHelp(): void {
   console.log(
-    `ast-graph - build a code graph from a repository (JS/TS/Java)
+    `codelens - build a code graph from a repository (JS/TS/Java)
 
 Usage:
-  ast-graph <repo-path-or-git-url> [options]
+  codelens <repo-path-or-git-url> [options]
 
   When given a git URL (https://, git@, ssh://), the tool clones into
   ~/.code-lens-aI/cache/<host>/<owner>/<name>/ and indexes from there.
@@ -268,7 +268,7 @@ async function main(): Promise<void> {
   if (args.mcp) {
     if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
       console.error(
-        "[ast-graph] --mcp requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
+        "[codelens] --mcp requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
       );
       process.exit(2);
     }
@@ -313,7 +313,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.error(`[ast-graph] analysing ${path.resolve(args.repo)} ...`);
+  console.error(`[codelens] analysing ${path.resolve(args.repo)} ...`);
   const graph = analyzeRepository(args.repo, {
     ignore: args.ignore,
     resolveCallsByName: !args.noResolveCalls,
@@ -324,8 +324,8 @@ async function main(): Promise<void> {
     for (const n of graph.nodes) counts[n.kind] = (counts[n.kind] ?? 0) + 1;
     const eCounts: Record<string, number> = {};
     for (const e of graph.edges) eCounts[e.kind] = (eCounts[e.kind] ?? 0) + 1;
-    console.error("[ast-graph] node counts:", counts);
-    console.error("[ast-graph] edge counts:", eCounts);
+    console.error("[codelens] node counts:", counts);
+    console.error("[codelens] edge counts:", eCounts);
   }
 
   // ── JSON output ─────────────────────────────────────────────────────
@@ -339,7 +339,7 @@ async function main(): Promise<void> {
     if (args.out) {
       const outPath = path.resolve(args.out);
       fs.writeFileSync(outPath, json, "utf8");
-      console.error(`[ast-graph] wrote ${outPath}`);
+      console.error(`[codelens] wrote ${outPath}`);
     } else if (!args.neo4jUri) {
       // Only stream to stdout if we're not also writing to neo4j (keeps logs clean).
       process.stdout.write(json + "\n");
@@ -350,11 +350,11 @@ async function main(): Promise<void> {
   if (args.neo4jUri) {
     if (!args.neo4jUser || !args.neo4jPassword) {
       console.error(
-        "[ast-graph] --neo4j-uri requires --neo4j-user and --neo4j-password (or NEO4J_USER / NEO4J_PASSWORD env vars)",
+        "[codelens] --neo4j-uri requires --neo4j-user and --neo4j-password (or NEO4J_USER / NEO4J_PASSWORD env vars)",
       );
       process.exit(2);
     }
-    console.error(`[ast-graph] indexing into Neo4j at ${args.neo4jUri} ...`);
+    console.error(`[codelens] indexing into Neo4j at ${args.neo4jUri} ...`);
     const result = await indexToNeo4j(graph, {
       uri: args.neo4jUri,
       user: args.neo4jUser,
@@ -364,7 +364,7 @@ async function main(): Promise<void> {
       skipUnresolved: args.neo4jSkipUnresolved,
     });
     console.error(
-      `[ast-graph] indexed ${result.nodesWritten} nodes, ${result.edgesWritten} edges`,
+      `[codelens] indexed ${result.nodesWritten} nodes, ${result.edgesWritten} edges`,
     );
   }
 
@@ -372,11 +372,11 @@ async function main(): Promise<void> {
   if (args.cluster) {
     if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
       console.error(
-        "[ast-graph] --cluster requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
+        "[codelens] --cluster requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
       );
       process.exit(2);
     }
-    console.error("[ast-graph] running Leiden clustering ...");
+    console.error("[codelens] running Leiden clustering ...");
     const report = await clusterInNeo4j({
       uri: args.neo4jUri,
       user: args.neo4jUser,
@@ -388,7 +388,7 @@ async function main(): Promise<void> {
       minSize: args.clusterMinSize,
     });
     console.error(
-      `[ast-graph] clusters: ${report.communities} found, ` +
+      `[codelens] clusters: ${report.communities} found, ` +
         `${report.materialized} materialized (size >= ${args.clusterMinSize ?? 3}), ` +
         `${report.spineNodes} spine files (${report.filesScored} files scored)`,
     );
@@ -398,11 +398,11 @@ async function main(): Promise<void> {
   if (args.embed) {
     if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
       console.error(
-        "[ast-graph] --embed requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
+        "[codelens] --embed requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
       );
       process.exit(2);
     }
-    console.error("[ast-graph] computing embeddings ...");
+    console.error("[codelens] computing embeddings ...");
     const report = await computeAndStoreEmbeddings({
       uri: args.neo4jUri,
       user: args.neo4jUser,
@@ -412,7 +412,7 @@ async function main(): Promise<void> {
       batchSize: args.embedBatch,
     });
     console.error(
-      `[ast-graph] embedded ${report.embedded}/${report.totalCandidates} nodes ` +
+      `[codelens] embedded ${report.embedded}/${report.totalCandidates} nodes ` +
         `(skipped ${report.skipped}) in ${(report.durationMs / 1000).toFixed(1)}s`,
     );
   }
@@ -437,7 +437,7 @@ async function runIncremental(
 ): Promise<void> {
   if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
     console.error(
-      "[ast-graph] --incremental requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
+      "[codelens] --incremental requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
     );
     process.exit(2);
   }
@@ -464,7 +464,7 @@ async function runIncremental(
     gitWorkingTreeClean(absRepo)
   ) {
     console.error(
-      `[ast-graph] already up to date at ${headCommit.slice(0, 12)} (commit + clean tree)`,
+      `[codelens] already up to date at ${headCommit.slice(0, 12)} (commit + clean tree)`,
     );
     return;
   }
@@ -493,7 +493,7 @@ async function runIncremental(
     added = merged.added.filter((p) => indexable.has(p));
     deleted = merged.deleted; // may include files not in `indexable` — we still need to clean them up by path
     console.error(
-      `[ast-graph] git delta: ${changed.length} changed, ${added.length} added, ${deleted.length} deleted`,
+      `[codelens] git delta: ${changed.length} changed, ${added.length} added, ${deleted.length} deleted`,
     );
   } else {
     // Mode B (hash) — also handles cold cache (no prior repo meta).
@@ -516,12 +516,12 @@ async function runIncremental(
       if (!onDisk.has(p)) deleted.push(p);
     }
     console.error(
-      `[ast-graph] ${modeUsed} delta: ${changed.length} changed, ${added.length} added, ${deleted.length} deleted`,
+      `[codelens] ${modeUsed} delta: ${changed.length} changed, ${added.length} added, ${deleted.length} deleted`,
     );
   }
 
   if (changed.length + added.length + deleted.length === 0) {
-    console.error("[ast-graph] no changes detected");
+    console.error("[codelens] no changes detected");
     await setRepositoryMeta(ctx, absRepo, {
       indexedAt,
       lastCommit: headCommit,
@@ -538,7 +538,7 @@ async function runIncremental(
   for (const p of changed) dependents.delete(p);
   for (const p of added) dependents.delete(p);
   console.error(
-    `[ast-graph] cascade: ${dependents.size} dependent file(s) will be re-extracted`,
+    `[codelens] cascade: ${dependents.size} dependent file(s) will be re-extracted`,
   );
 
   // Final dirty set: files we'll re-extract from disk.
@@ -550,7 +550,7 @@ async function runIncremental(
   if (toDelete.size > 0) {
     const { deletedNodes } = await deleteFilesByPath(ctx, [...toDelete]);
     console.error(
-      `[ast-graph] scope-deleted ${deletedNodes} symbol+file node(s) across ${toDelete.size} file(s)`,
+      `[codelens] scope-deleted ${deletedNodes} symbol+file node(s) across ${toDelete.size} file(s)`,
     );
   }
 
@@ -578,7 +578,7 @@ async function runIncremental(
   let graphSummary = { nodesWritten: 0, edgesWritten: 0 };
   if (toExtract.size > 0) {
     console.error(
-      `[ast-graph] extracting ${toExtract.size} file(s) ...`,
+      `[codelens] extracting ${toExtract.size} file(s) ...`,
     );
     const graph = analyzeIncremental(absRepo, {
       ignore: args.ignore,
@@ -593,8 +593,8 @@ async function runIncremental(
       for (const n of graph.nodes) counts[n.kind] = (counts[n.kind] ?? 0) + 1;
       const eCounts: Record<string, number> = {};
       for (const e of graph.edges) eCounts[e.kind] = (eCounts[e.kind] ?? 0) + 1;
-      console.error("[ast-graph] node counts:", counts);
-      console.error("[ast-graph] edge counts:", eCounts);
+      console.error("[codelens] node counts:", counts);
+      console.error("[codelens] edge counts:", eCounts);
     }
 
     // Push without --neo4j-clear; MERGE semantics handle the partial graph.
@@ -607,7 +607,7 @@ async function runIncremental(
       skipUnresolved: args.neo4jSkipUnresolved,
     });
     console.error(
-      `[ast-graph] pushed ${graphSummary.nodesWritten} nodes, ${graphSummary.edgesWritten} edges`,
+      `[codelens] pushed ${graphSummary.nodesWritten} nodes, ${graphSummary.edgesWritten} edges`,
     );
   }
 
@@ -620,7 +620,7 @@ async function runIncremental(
 
   // ── Optional clustering / embeddings ────────────────────────────────
   if (args.cluster) {
-    console.error("[ast-graph] running Leiden clustering ...");
+    console.error("[codelens] running Leiden clustering ...");
     const report = await clusterInNeo4j({
       uri: args.neo4jUri,
       user: args.neo4jUser,
@@ -632,13 +632,13 @@ async function runIncremental(
       minSize: args.clusterMinSize,
     });
     console.error(
-      `[ast-graph] clusters: ${report.communities} found, ` +
+      `[codelens] clusters: ${report.communities} found, ` +
         `${report.materialized} materialized (size >= ${args.clusterMinSize ?? 3}), ` +
         `${report.spineNodes} spine files (${report.filesScored} files scored)`,
     );
   }
   if (args.embed) {
-    console.error("[ast-graph] computing embeddings ...");
+    console.error("[codelens] computing embeddings ...");
     const report = await computeAndStoreEmbeddings({
       uri: args.neo4jUri,
       user: args.neo4jUser,
@@ -648,7 +648,7 @@ async function runIncremental(
       batchSize: args.embedBatch,
     });
     console.error(
-      `[ast-graph] embedded ${report.embedded}/${report.totalCandidates} nodes ` +
+      `[codelens] embedded ${report.embedded}/${report.totalCandidates} nodes ` +
         `(skipped ${report.skipped}) in ${(report.durationMs / 1000).toFixed(1)}s`,
     );
   }
@@ -657,11 +657,11 @@ async function runIncremental(
 async function runClusterOnly(args: CliArgs): Promise<void> {
   if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
     console.error(
-      "[ast-graph] --cluster-only requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
+      "[codelens] --cluster-only requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
     );
     process.exit(2);
   }
-  console.error("[ast-graph] running Leiden clustering against existing graph ...");
+  console.error("[codelens] running Leiden clustering against existing graph ...");
   const report = await clusterInNeo4j({
     uri: args.neo4jUri,
     user: args.neo4jUser,
@@ -673,7 +673,7 @@ async function runClusterOnly(args: CliArgs): Promise<void> {
     minSize: args.clusterMinSize,
   });
   console.error(
-    `[ast-graph] clusters: ${report.communities} found, ` +
+    `[codelens] clusters: ${report.communities} found, ` +
       `${report.materialized} materialized (size >= ${args.clusterMinSize ?? 3}), ` +
       `${report.spineNodes} spine files (${report.filesScored} files scored)`,
   );
@@ -682,7 +682,7 @@ async function runClusterOnly(args: CliArgs): Promise<void> {
 async function runSearch(args: CliArgs): Promise<void> {
   if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
     console.error(
-      "[ast-graph] --search requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
+      "[codelens] --search requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
     );
     process.exit(2);
   }
@@ -692,7 +692,7 @@ async function runSearch(args: CliArgs): Promise<void> {
   );
   try {
     console.error(
-      `[ast-graph] search "${args.searchQuery}" ` +
+      `[codelens] search "${args.searchQuery}" ` +
         `(mode=${args.searchMode ?? "auto"}, limit=${args.searchLimit ?? 20})`,
     );
     const hits = await search(driver, args.searchQuery!, {
@@ -701,7 +701,7 @@ async function runSearch(args: CliArgs): Promise<void> {
       database: args.neo4jDatabase,
     });
     if (hits.length === 0) {
-      console.error("[ast-graph] no hits");
+      console.error("[codelens] no hits");
       return;
     }
     for (const hit of hits) {
@@ -722,6 +722,6 @@ async function runSearch(args: CliArgs): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  console.error("[ast-graph] error:", err instanceof Error ? err.stack : err);
+  console.error("[codelens] error:", err instanceof Error ? err.stack : err);
   process.exit(1);
 });
