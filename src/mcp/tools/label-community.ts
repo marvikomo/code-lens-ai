@@ -26,9 +26,10 @@ const labelCommunitySchema: Record<string, any> = {
 
 /**
  * Lets the agent attach a semantic label and optional description to a
- * Leiden community. Labels persist across --cluster-only reruns (the
- * materialization MERGE preserves them on ON MATCH); they are wiped by
- * --neo4j-clear (intentional).
+ * Leiden community. Labels are wiped by any re-clustering run (both
+ * `--cluster` and `--cluster-only` drop+rematerialize Community nodes in
+ * step 8a) and by `--neo4j-clear`. They persist only between re-clusters.
+ * Use `--incremental` for day-to-day updates to preserve labels.
  *
  * Designed to be called on first connect after `get_overview` shows the
  * "ACTION REQUIRED" hint listing unlabeled communities.
@@ -45,9 +46,10 @@ export function registerLabelCommunity(
         "Attach a short semantic label (and optional description) to a community " +
         "detected by Leiden clustering. Use this on first connect when get_overview " +
         "shows unlabeled communities — pick a 2-4 word name describing what the " +
-        "community does, based on its spine files and sample. Labels persist across " +
-        "re-clustering until --neo4j-clear is used. Subsequent get_overview calls " +
-        "show your label instead of community-N.",
+        "community does, based on its spine files and sample. Labels are wiped by " +
+        "any re-clustering (--cluster, --cluster-only, --neo4j-clear); use " +
+        "--incremental for day-to-day updates to preserve them. Subsequent " +
+        "get_overview calls show your label instead of community-N.",
       inputSchema: labelCommunitySchema,
     },
     async ({ communityId, label, description }) => {
@@ -66,12 +68,22 @@ export function registerLabelCommunity(
         cypher += `, c.description = $description, c.descriptionWrittenAt = $now`;
         params.description = description;
         // Snapshot the current spine (top-by-pagerank, is_core) so we can
-        // detect drift later — checked against current spine on read.
+        // detect drift later. Stores TWO parallel arrays:
+        //   descriptionSpineSnapshot — file paths
+        //   descriptionSpineHashes   — contentHash at write time (same index)
+        // Read-side compares against current spine + current contentHash to
+        // detect dropped / added / content-changed. Files without
+        // contentHash (legacy/pre-incremental graphs) get '' — treated as
+        // "unknown, skip" on the read side so we don't false-positive.
         cypher += `
           WITH c
           OPTIONAL MATCH (c)<-[:IN_COMMUNITY]-(spine:File {is_core: true})
-          WITH c, collect(DISTINCT spine.path) AS spinePaths
-          SET c.descriptionSpineSnapshot = spinePaths`;
+          WITH c, collect(DISTINCT { path: spine.path, hash: spine.contentHash }) AS info
+          WITH c,
+               [x IN info WHERE x.path IS NOT NULL | x.path] AS paths,
+               [x IN info WHERE x.path IS NOT NULL | coalesce(x.hash, '')] AS hashes
+          SET c.descriptionSpineSnapshot = paths,
+              c.descriptionSpineHashes  = hashes`;
       }
       cypher += ` RETURN c.communityId AS id, c.label AS label`;
 

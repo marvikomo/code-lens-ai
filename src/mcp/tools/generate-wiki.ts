@@ -22,7 +22,9 @@ interface CommunityRow {
   description: string | null;
   descriptionWrittenAt: string | null;
   descriptionSpineSnapshot: string[];
+  descriptionSpineHashes: string[];
   currentSpine: string[];
+  currentSpineHashes: string[];
   size: number;
 }
 
@@ -175,16 +177,23 @@ async function runGenerateWiki(
     ),
     readQuery(
       ctx,
+      // Fetch the current spine PATHS + contentHashes alongside the
+      // snapshot so describeDescriptionFreshness can detect content drift
+      // (same shape as get-overview.ts — see comments there).
       `MATCH (c:Community)<-[:IN_COMMUNITY]-(f:File)
        OPTIONAL MATCH (c)<-[:IN_COMMUNITY]-(curSpine:File {is_core: true})
        WITH c, count(DISTINCT f) AS size,
-            collect(DISTINCT curSpine.path) AS currentSpine
+            collect(DISTINCT { path: curSpine.path, hash: curSpine.contentHash }) AS curSpineInfo
+       WITH c, size,
+            [x IN curSpineInfo WHERE x.path IS NOT NULL | x.path] AS currentSpine,
+            [x IN curSpineInfo WHERE x.path IS NOT NULL | coalesce(x.hash, '')] AS currentSpineHashes
        RETURN c.communityId AS id, c.label AS label,
               c.heuristicLabel AS heuristicLabel,
               c.description AS description,
               c.descriptionWrittenAt AS descriptionWrittenAt,
               c.descriptionSpineSnapshot AS descriptionSpineSnapshot,
-              currentSpine, size
+              c.descriptionSpineHashes AS descriptionSpineHashes,
+              currentSpine, currentSpineHashes, size
        ORDER BY size DESC`,
     ),
     readQuery(
@@ -294,8 +303,14 @@ async function runGenerateWiki(
     descriptionSpineSnapshot: Array.isArray(r.descriptionSpineSnapshot)
       ? (r.descriptionSpineSnapshot as unknown[]).map(String)
       : [],
+    descriptionSpineHashes: Array.isArray(r.descriptionSpineHashes)
+      ? (r.descriptionSpineHashes as unknown[]).map(String)
+      : [],
     currentSpine: Array.isArray(r.currentSpine)
       ? (r.currentSpine as unknown[]).map(String)
+      : [],
+    currentSpineHashes: Array.isArray(r.currentSpineHashes)
+      ? (r.currentSpineHashes as unknown[]).map(String)
       : [],
     size: asNumber(r.size) ?? 0,
   }));
@@ -560,17 +575,42 @@ function renderWiki(d: RenderInput): string {
     }
 
     for (const c of fullDetail) {
-      out.push(headingFor(c));
+      // Compute freshness first — if invalidated (>50% spine drift), we
+      // suppress the agent's label/description and render the community
+      // as if it had no semantic label (heuristic or UNLABELED). Lazy
+      // invalidation: read-time only, the underlying DB properties stay.
+      const freshness = c.description
+        ? describeDescriptionFreshness(
+            c.descriptionWrittenAt,
+            c.descriptionSpineSnapshot,
+            c.descriptionSpineHashes,
+            c.currentSpine,
+            c.currentSpineHashes,
+          )
+        : null;
+
+      const labelInvalidated = !!(freshness && freshness.invalidated);
+      const renderC: CommunityRow = labelInvalidated
+        ? { ...c, label: null, description: null }
+        : c;
+      out.push(headingFor(renderC));
       out.push("");
 
-      if (c.description) {
-        out.push(`**Purpose:** ${c.description}`);
-        const freshness = describeDescriptionFreshness(
-          c.descriptionWrittenAt,
-          c.descriptionSpineSnapshot,
-          c.currentSpine,
+      if (renderC.description) {
+        out.push(`**Purpose:** ${renderC.description}`);
+        if (freshness && freshness.annotation) {
+          out.push(`> ${freshness.annotation}`);
+        }
+      } else if (labelInvalidated && c.label) {
+        // Stale-auto-invalidated: surface what was there and why so the
+        // agent knows there's a re-label opportunity (and what the prior
+        // label was — often a useful starting point for the new one).
+        const pct = Math.round((freshness?.driftFraction ?? 0) * 100);
+        out.push(
+          `**Purpose:** [AGENT FILLS — auto-invalidated, was \`${c.label}\` ` +
+            `(${pct}% spine drift since labeling). Re-infer from spine files ` +
+            `below and call \`label_community\` to refresh.]`,
         );
-        if (freshness) out.push(`> ${freshness}`);
       } else {
         out.push("**Purpose:** [AGENT FILLS — 1 paragraph inferred from spine files below]");
       }
@@ -775,43 +815,110 @@ function describeAge(iso: string | null | undefined): string | null {
 }
 
 /**
- * Build a freshness annotation for an agent-written community description.
- * Combines wall-clock age (from `descriptionWrittenAt`) with spine-file
- * drift (snapshot taken at write-time vs. current spine). Returns null when
- * there's nothing to flag — keeps the wiki output uncluttered for fresh,
- * stable summaries. Mirror of the same helper in get-overview.ts; kept
- * inline rather than shared because the surface is tiny.
+ * Hash-baseline freshness check for an agent-written community description.
+ * Mirror of the helper in get-overview.ts (see that file for full notes on
+ * the tiering and the union-size denominator). Kept inline rather than
+ * factored because the two surfaces have slightly different render shapes
+ * and the helper itself is small.
  */
+interface FreshnessResult {
+  tier: "verified" | "no-baseline" | "drifted" | "verify" | "stale";
+  annotation: string | null;
+  invalidated: boolean;
+  driftFraction: number;
+}
+
 function describeDescriptionFreshness(
   writtenAt: string | null,
-  snapshot: string[],
-  currentSpine: string[],
-): string | null {
-  const parts: string[] = [];
+  snapshotPaths: string[],
+  snapshotHashes: string[],
+  currentSpinePaths: string[],
+  currentSpineHashes: string[],
+): FreshnessResult {
+  const snapMap = new Map<string, string>();
+  for (let i = 0; i < snapshotPaths.length; i++) {
+    snapMap.set(snapshotPaths[i], snapshotHashes[i] ?? "");
+  }
+  const curMap = new Map<string, string>();
+  for (let i = 0; i < currentSpinePaths.length; i++) {
+    curMap.set(currentSpinePaths[i], currentSpineHashes[i] ?? "");
+  }
 
+  if (snapMap.size === 0 || curMap.size === 0) {
+    return { tier: "verified", annotation: null, invalidated: false, driftFraction: 0 };
+  }
+
+  let dropped = 0;
+  let added = 0;
+  let contentChanged = 0;
+  let hasAnyBaselineHash = false;
+  const union = new Set([...snapMap.keys(), ...curMap.keys()]);
+  for (const path of union) {
+    const inSnap = snapMap.has(path);
+    const inCur = curMap.has(path);
+    if (inSnap && !inCur) dropped++;
+    else if (!inSnap && inCur) added++;
+    else {
+      const snapHash = snapMap.get(path) ?? "";
+      const curHash = curMap.get(path) ?? "";
+      if (snapHash) hasAnyBaselineHash = true;
+      if (snapHash && curHash && snapHash !== curHash) contentChanged++;
+    }
+  }
+
+  const driftFraction =
+    union.size === 0 ? 0 : (dropped + added + contentChanged) / union.size;
+
+  const ageParts: string[] = [];
   if (writtenAt) {
     const ts = Date.parse(writtenAt);
     if (!Number.isNaN(ts)) {
       const ageDays = Math.floor((Date.now() - ts) / 86_400_000);
-      if (ageDays >= 7) parts.push(`written ${ageDays}d ago`);
+      if (ageDays >= 7) ageParts.push(`written ${ageDays}d ago`);
     }
   }
 
-  if (snapshot.length > 0 && currentSpine.length > 0) {
-    const snap = new Set(snapshot);
-    const cur = new Set(currentSpine);
-    let added = 0;
-    let dropped = 0;
-    for (const p of cur) if (!snap.has(p)) added++;
-    for (const p of snap) if (!cur.has(p)) dropped++;
-    const drift = added + dropped;
-    if (drift > 0) {
-      parts.push(`spine has shifted (${dropped} dropped, ${added} added since)`);
-    }
+  const driftParts: string[] = [];
+  if (dropped) driftParts.push(`${dropped} dropped`);
+  if (added) driftParts.push(`${added} added`);
+  if (contentChanged) driftParts.push(`${contentChanged} content-changed`);
+
+  const totalDrift = dropped + added + contentChanged;
+
+  if (!hasAnyBaselineHash && totalDrift === 0) {
+    return {
+      tier: "no-baseline",
+      annotation: "no content baseline — verify if material",
+      invalidated: false,
+      driftFraction: 0,
+    };
   }
 
-  if (parts.length === 0) return null;
-  return parts.join("; ") + " — verify before relying";
+  if (totalDrift === 0 && ageParts.length === 0) {
+    return { tier: "verified", annotation: null, invalidated: false, driftFraction: 0 };
+  }
+
+  let tier: FreshnessResult["tier"];
+  let invalidated = false;
+  if (driftFraction === 0) tier = "verified";
+  else if (driftFraction <= 0.3) tier = "drifted";
+  else if (driftFraction <= 0.5) tier = "verify";
+  else {
+    tier = "stale";
+    invalidated = true;
+  }
+
+  const allParts: string[] = [];
+  if (driftParts.length > 0) allParts.push(`spine: ${driftParts.join(", ")}`);
+  if (ageParts.length > 0) allParts.push(ageParts.join("; "));
+
+  let annotation: string | null = null;
+  if (allParts.length > 0) {
+    const prefix = tier === "stale" || tier === "verify" ? "⚠️ " : "";
+    annotation = `${prefix}${allParts.join("; ")} — verify before relying`;
+  }
+
+  return { tier, annotation, invalidated, driftFraction };
 }
 
 /**

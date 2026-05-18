@@ -112,12 +112,19 @@ export function analyzeRepository(
       } else if (entry.isFile()) {
         const lang = detectLanguage(full);
         if (!lang) continue;
+        // Stamp contentHash on every File regardless of indexing path
+        // (incremental computes hashes for its own purposes; non-incremental
+        // didn't until now, leaving the freshness/staleness checks blind).
+        // Cheap — one sha256 per file at index time.
+        let contentHash: string | undefined;
+        try { contentHash = sha256OfFile(full); } catch { /* unreadable; skip */ }
         const fileNode = builder.addNode({
           id: `file:${full}`,
           kind: "File",
           name: entry.name,
           path: full,
           language: lang,
+          contentHash,
         });
         builder.addEdge({
           kind: "CONTAINS",
