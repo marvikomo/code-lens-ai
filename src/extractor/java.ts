@@ -113,6 +113,7 @@ export class JavaExtractor implements LanguageExtractor {
           kind: "EXTENDS",
           from: cls.id,
           to: `unresolved:class:${symbol}`,
+          source: "name_only",
           unresolved: symbol,
         });
       }
@@ -127,6 +128,7 @@ export class JavaExtractor implements LanguageExtractor {
             kind: "IMPLEMENTS",
             from: cls.id,
             to: `unresolved:interface:${symbol}`,
+            source: "name_only",
             unresolved: symbol,
           });
         }
@@ -199,6 +201,7 @@ export class JavaExtractor implements LanguageExtractor {
         kind: "CALLS",
         from: enclosing.id,
         to: `unresolved:callable:${symbol}`,
+        source: "name_only",
         unresolved: symbol,
       });
     }
@@ -211,6 +214,7 @@ export class JavaExtractor implements LanguageExtractor {
         kind: "CALLS",
         from: enclosing.id,
         to: `unresolved:callable:${symbol}`,
+        source: "name_only",
         unresolved: symbol,
       });
     }

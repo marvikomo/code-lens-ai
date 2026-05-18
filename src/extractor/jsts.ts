@@ -48,16 +48,36 @@ export class JsTsExtractor implements LanguageExtractor {
 
       case "export_statement": {
         // Re-export with source: `export { foo } from './bar'` or `export * from './bar'`.
-        // We emit an IMPORTS edge so file→file dependency is captured. Phase 2
-        // of the alias-resolution work will additionally emit REEXPORTS here
-        // so the resolver can follow the chain. For now, the re-export's source
-        // file becomes a normal IMPORTS dependency.
-        for (const child of node.namedChildren) {
-          if (child.type === "string") {
-            const spec = stripQuotes(child.text);
-            ctx.pendingImports.push({ from: ctx.fileNode.id, spec });
-            return;
+        const source = node.namedChildren.find((c) => c.type === "string");
+        if (source) {
+          const spec = stripQuotes(source.text);
+          ctx.pendingImports.push({ from: ctx.fileNode.id, spec });
+
+          const exportClause = node.namedChildren.find(
+            (c) => c.type === "export_clause",
+          );
+          if (exportClause) {
+            for (const reexportSpec of exportClause.namedChildren) {
+              if (reexportSpec.type !== "export_specifier") continue;
+              const localName =
+                fieldText(reexportSpec, "name") ?? reexportSpec.text;
+              const exportedName =
+                fieldText(reexportSpec, "alias") ?? localName;
+              if (!localName) continue;
+              ctx.pendingImports.push({
+                from: ctx.fileNode.id,
+                spec,
+                reexport: { kind: "named", localName, exportedName },
+              });
+            }
+          } else {
+            ctx.pendingImports.push({
+              from: ctx.fileNode.id,
+              spec,
+              reexport: { kind: "all" },
+            });
           }
+          return;
         }
 
         // Direct exports: `export function foo()`, `export class Foo`,
@@ -384,6 +404,7 @@ export class JsTsExtractor implements LanguageExtractor {
               kind: "EXTENDS",
               from: cls.id,
               to: `unresolved:class:${symbol}`,
+              source: "name_only",
               unresolved: symbol,
             });
           }
@@ -395,6 +416,7 @@ export class JsTsExtractor implements LanguageExtractor {
               kind: "IMPLEMENTS",
               from: cls.id,
               to: `unresolved:interface:${symbol}`,
+              source: "name_only",
               unresolved: symbol,
             });
           }
@@ -405,6 +427,7 @@ export class JsTsExtractor implements LanguageExtractor {
             kind: "EXTENDS",
             from: cls.id,
             to: `unresolved:class:${symbol}`,
+            source: "name_only",
             unresolved: symbol,
           });
         }
@@ -564,6 +587,7 @@ export class JsTsExtractor implements LanguageExtractor {
                 kind: "CALLS",
                 from: enclosing.id,
                 to: `unresolved:callable:${symbol}`,
+                source: "name_only",
                 unresolved: symbol,
               });
             }

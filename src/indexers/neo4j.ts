@@ -161,8 +161,12 @@ export async function indexToNeo4j(
 }
 
 function nodeToRow(n: GraphNode): Record<string, unknown> {
+  // `kind` mirrors the Neo4j label so cypher queries can read `n.kind`
+  // directly instead of unwrapping `labels(n)` (which carries both `:CodeNode`
+  // and `:<Kind>` and is order-dependent — a real footgun real users hit).
   const props: Record<string, unknown> = {
     name: n.name,
+    kind: n.kind,
   };
   if (n.path) props.path = n.path;
   if (n.language) props.language = n.language;
@@ -196,6 +200,7 @@ function nodeToRow(n: GraphNode): Record<string, unknown> {
 
 function edgeToRow(e: GraphEdge): Record<string, unknown> {
   const props: Record<string, unknown> = {};
+  if (e.source) props.source = e.source;
   if (e.unresolved) props.unresolved = e.unresolved;
   if (e.meta) {
     for (const [k, v] of Object.entries(e.meta)) {

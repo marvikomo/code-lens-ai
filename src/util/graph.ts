@@ -41,7 +41,19 @@ export type EdgeKind =
   // Used by the resolver to bind cross-file calls/inheritance via IMPORTS→EXPORTS
   // lookup instead of name-only heuristics. Phase 1 of the alias-resolution
   // upgrade described in the symbol-aliasing problem brief.
-  | "EXPORTS";
+  | "EXPORTS"
+  // REEXPORTS(File → File) for `export { x as y } from "./mod"`.
+  // Carries `meta.localName` and `meta.exportedName`.
+  | "REEXPORTS"
+  // REEXPORTS_ALL(File → File) for `export * from "./mod"`.
+  | "REEXPORTS_ALL";
+
+export type EdgeSource =
+  | "static"
+  | "via_imports"
+  | "via_reexport"
+  | "name_only"
+  | "dynamic";
 
 export interface Position {
   row: number;
@@ -96,6 +108,8 @@ export interface GraphEdge {
   kind: EdgeKind;
   from: string;
   to: string;
+  /** How confidently this relationship was resolved. */
+  source?: EdgeSource;
   /** When `to` could not be resolved to a real node id, the raw symbol/path. */
   unresolved?: string;
   meta?: Record<string, unknown>;
@@ -139,16 +153,17 @@ export class GraphBuilder {
   }
 
   addEdge(edge: Omit<GraphEdge, "id">): GraphEdge {
-    const id = `${edge.kind}:${edge.from}->${edge.to}`;
+    const name = graphEdgeName(edge);
+    const id = `${name}:${edge.from}->${edge.to}`;
     const existing = this.g.edge({
       v: edge.from,
       w: edge.to,
-      name: edge.kind,
+      name,
     }) as GraphEdge | undefined;
     if (existing) return existing;
 
     const e: GraphEdge = { id, ...edge };
-    this.g.setEdge({ v: edge.from, w: edge.to, name: edge.kind }, e);
+    this.g.setEdge({ v: edge.from, w: edge.to, name }, e);
     return e;
   }
 
@@ -176,4 +191,11 @@ export class GraphBuilder {
       .filter((e): e is GraphEdge => e !== undefined);
     return { nodes, edges, graph: this.g };
   }
+}
+
+function graphEdgeName(edge: Omit<GraphEdge, "id">): string {
+  if (edge.kind !== "REEXPORTS") return edge.kind;
+  const localName = String(edge.meta?.localName ?? "");
+  const exportedName = String(edge.meta?.exportedName ?? "");
+  return `${edge.kind}:${localName}:${exportedName}`;
 }

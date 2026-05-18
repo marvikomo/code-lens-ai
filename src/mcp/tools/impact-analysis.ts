@@ -22,6 +22,7 @@ interface CallerInfo {
   name: string;
   path: string;
   startRow: number;
+  source: string;
   isTest: boolean;
   isSpineCaller: boolean;
   callerPagerank: number;
@@ -46,8 +47,8 @@ export function registerImpactAnalysis(
         "(3) which callers are themselves spine files (their changes ripple); " +
         "(4) the test files you'll need to update, as a copy-paste-friendly path list; " +
         "(5) production callers grouped by architectural community. " +
-        "Always includes a caveat: results are based on visible callers in the indexed graph " +
-        "and may miss callers via re-exports, factory wrappers, or dynamic dispatch. " +
+        "Always includes a confidence breakdown: static/import/re-export/name-only/dynamic " +
+        "so safe-looking results remain honest about uncertainty. " +
         "Use BEFORE non-trivial edits, before code review, or to decide if it's safe to delete code.",
       inputSchema: impactAnalysisSchema,
     },
@@ -107,14 +108,26 @@ async function runImpactAnalysis(
      WHERE (target:Function OR target:Method OR target:Class OR target:Variable)
      ${file ? "AND target.path CONTAINS $file" : ""}
      WITH target LIMIT 1
-     MATCH (caller)-[r:CALLS*1..${d}]->(target)
-     WITH DISTINCT caller, size(r) AS distance
+     MATCH p=(caller)-[:CALLS*1..${d}]->(target)
+     WITH caller,
+          collect({
+            distance: length(p),
+            sources: [rel IN relationships(p) | coalesce(rel.source, "name_only")]
+          }) AS paths
+     WITH caller,
+          reduce(minD = 999999, pathInfo IN paths |
+            CASE WHEN pathInfo.distance < minD THEN pathInfo.distance ELSE minD END
+          ) AS distance,
+          paths
+     WITH caller, distance,
+          [pathInfo IN paths WHERE pathInfo.distance = distance][0].sources AS sources
      OPTIONAL MATCH (caller)<-[:DEFINES]-(callerFile:File)
      OPTIONAL MATCH (callerFile)-[:IN_COMMUNITY]->(callerComm:Community)
      RETURN caller.name AS name,
             caller.path AS path,
             caller.startRow AS startRow,
             distance,
+            sources,
             callerFile.is_core AS callerIsCore,
             callerFile.pagerank AS callerPagerank,
             callerFile.isTest AS callerIsTest,
@@ -127,6 +140,7 @@ async function runImpactAnalysis(
     name: String(r.name ?? "(anonymous)"),
     path: String(r.path ?? ""),
     startRow: asNumber(r.startRow) ?? 0,
+    source: primarySource(r.sources),
     isTest: !!r.callerIsTest,
     isSpineCaller: !!r.callerIsCore,
     callerPagerank: asNumber(r.callerPagerank) ?? 0,
@@ -148,6 +162,7 @@ async function runImpactAnalysis(
   // because of high boundary degree (many imports) but tests don't ripple
   // outward, so they're not load-bearing in the blast-radius sense.
   const spineCallers = direct.filter((c) => c.isSpineCaller && !c.isTest);
+  const confidence = summarizeConfidence(direct);
 
   // Group by community — set of communityIds seen in callers (ignoring "this" community).
   const callerCommunityIds = new Set<number>();
@@ -173,6 +188,7 @@ async function runImpactAnalysis(
     spineCount: spineCallers.length,
     crossCommunityCount: otherCommunities.length,
     targetIsCore,
+    confidence,
   });
 
   // 4. Apply truncation policy to production callers grouped by community.
@@ -195,6 +211,7 @@ async function runImpactAnalysis(
       prodTransitive,
       testTransitive,
       spineCallers,
+      confidence,
       otherCommunities,
       callerCommunityIds,
       renderedProd,
@@ -209,8 +226,15 @@ function computeVerdict(args: {
   spineCount: number;
   crossCommunityCount: number;
   targetIsCore: boolean;
+  confidence: ConfidenceSummary;
 }): { tone: "safe" | "focus" | "risky"; line: string } {
-  const { prodDirectCount, spineCount, crossCommunityCount, targetIsCore } = args;
+  const {
+    prodDirectCount,
+    spineCount,
+    crossCommunityCount,
+    targetIsCore,
+    confidence,
+  } = args;
 
   // Risky requires real caller-side signal; targetIsCore alone is not enough
   // (a defunct helper inside a spine file has no real blast radius).
@@ -240,7 +264,7 @@ function computeVerdict(args: {
           : "") +
         (spineCount > 0 ? `, ${spineCount} spine caller${pluralS(spineCount)}` : "") +
         (targetIsCore ? `, target is itself a spine file` : "") +
-        ".",
+        `. ${confidenceSentence(confidence)}`,
     };
   }
   if (isFocus) {
@@ -253,15 +277,45 @@ function computeVerdict(args: {
           : "") +
         (spineCount > 0 ? `, ${spineCount} spine caller${pluralS(spineCount)}` : "") +
         (targetIsCore ? ", in a spine file" : "") +
-        ".",
+        `. ${confidenceSentence(confidence)}`,
     };
   }
   return {
     tone: "safe",
     line:
       `Probably safe to change. ${prodDirectCount} direct production caller${pluralS(prodDirectCount)}` +
-      `, contained to one community, no spine callers.`,
+      `, contained to one community, no spine callers. ${confidenceSentence(confidence)}`,
   };
+}
+
+interface ConfidenceSummary {
+  high: number;
+  nameOnly: number;
+  dynamic: number;
+  total: number;
+  bySource: Record<string, number>;
+}
+
+function summarizeConfidence(callers: CallerInfo[]): ConfidenceSummary {
+  const bySource: Record<string, number> = {};
+  for (const c of callers) {
+    bySource[c.source] = (bySource[c.source] ?? 0) + 1;
+  }
+  const high =
+    (bySource.static ?? 0) +
+    (bySource.via_imports ?? 0) +
+    (bySource.via_reexport ?? 0);
+  const nameOnly = bySource.name_only ?? 0;
+  const dynamic = bySource.dynamic ?? 0;
+  return { high, nameOnly, dynamic, total: callers.length, bySource };
+}
+
+function confidenceSentence(c: ConfidenceSummary): string {
+  if (c.total === 0) return "0 visible callers at any confidence.";
+  const parts = [`${c.high} high-confidence`];
+  if (c.nameOnly > 0) parts.push(`${c.nameOnly} name-only`);
+  if (c.dynamic > 0) parts.push(`${c.dynamic} dynamic/heuristic`);
+  return `Confidence: ${parts.join(", ")}.`;
 }
 
 interface TruncatedProd {
@@ -352,6 +406,7 @@ interface RenderArgs {
   prodTransitive: CallerInfo[];
   testTransitive: CallerInfo[];
   spineCallers: CallerInfo[];
+  confidence: ConfidenceSummary;
   otherCommunities: number[];
   callerCommunityIds: Set<number>;
   renderedProd: TruncatedProd;
@@ -374,9 +429,14 @@ function renderImpactAnalysis(a: RenderArgs): string {
   out.push(a.verdict.line);
   out.push("");
   out.push(
-    "> Based on visible callers in the indexed graph. May miss callers via re-exports, " +
-      "factory wrappers, or dynamic dispatch. Always sanity-check before destructive edits.",
+    "> Based on visible callers in the indexed graph. Low-confidence and dynamic callers are surfaced separately; still sanity-check before destructive edits.",
   );
+  if (a.confidence.nameOnly > 0 || a.confidence.dynamic > 0) {
+    out.push("");
+    out.push(
+      `Confidence breakdown: ${formatConfidenceBreakdown(a.confidence)}.`,
+    );
+  }
   out.push("");
 
   // Cross-community headline.
@@ -458,7 +518,7 @@ function renderImpactAnalysis(a: RenderArgs): string {
       out.push(`### ${label}${isHome ? " (target's home)" : ""}`);
       for (const c of slot.kept) {
         const star = c.isSpineCaller ? "★ " : "";
-        out.push(`- ${star}\`${c.name}\` — ${c.path}:${c.startRow + 1}`);
+        out.push(`- ${star}\`${c.name}\` — ${c.path}:${c.startRow + 1} (${sourceLabel(c.source)})`);
       }
       if (slot.total > slot.kept.length) {
         out.push(`- … and ${slot.total - slot.kept.length} more in this community`);
@@ -503,6 +563,7 @@ function renderImpactAnalysis(a: RenderArgs): string {
   out.push("");
   out.push(`- Target file is_core: ${a.targetIsCore ? "yes (target is a spine file)" : "no"}`);
   out.push(`- Direct caller count: ${a.direct.length} (${a.prodDirect.length} prod, ${a.testDirect.length} test)`);
+  out.push(`- Caller confidence: ${formatConfidenceBreakdown(a.confidence)}`);
   out.push(`- Transitive caller count (depth ≤ ${a.maxDepth}): ${a.transitive.length} (${a.prodTransitive.length} prod, ${a.testTransitive.length} test)`);
   out.push(`- Interface impl callers: N/A (Tier 2 not yet enabled)`);
   out.push(`- Risk score: ${a.riskScore.toFixed(1)} (advisory metadata, see breakdown above for the actual signal)`);
@@ -513,4 +574,42 @@ function renderImpactAnalysis(a: RenderArgs): string {
 /** Returns "s" for plural counts, "" for 1. Cleaner than the previous variadic helper. */
 function pluralS(n: number): string {
   return n === 1 ? "" : "s";
+}
+
+function primarySource(value: unknown): string {
+  const sources = Array.isArray(value) ? value : [];
+  const first = sources.find((s) => typeof s === "string");
+  return typeof first === "string" ? first : "name_only";
+}
+
+function sourceLabel(source: string): string {
+  switch (source) {
+    case "static":
+      return "static";
+    case "via_imports":
+      return "import-confirmed";
+    case "via_reexport":
+      return "re-export-confirmed";
+    case "dynamic":
+      return "dynamic";
+    case "name_only":
+      return "name-only";
+    default:
+      return source;
+  }
+}
+
+function formatConfidenceBreakdown(c: ConfidenceSummary): string {
+  const ordered = [
+    "static",
+    "via_imports",
+    "via_reexport",
+    "name_only",
+    "dynamic",
+  ];
+  const parts = ordered
+    .map((source) => ({ source, count: c.bySource[source] ?? 0 }))
+    .filter((item) => item.count > 0)
+    .map((item) => `${item.count} ${sourceLabel(item.source)}`);
+  return parts.length > 0 ? parts.join(", ") : "0 callers";
 }

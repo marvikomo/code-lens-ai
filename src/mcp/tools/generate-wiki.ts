@@ -114,15 +114,14 @@ export function registerGenerateWiki(
     {
       title: "Generate a wiki skeleton for the indexed codebase",
       description:
-        "Produces a structured markdown wiki with all the STRUCTURAL facts pre-computed: " +
+        "Produces a structured markdown wiki with the structural facts pre-computed: " +
         "per-community spine files, top functions, route inventory, entry points, test breakdown, " +
         "and a glossary of the most-called symbols. Sections marked [AGENT FILLS] need " +
         "synthesis from you (codebase purpose, per-subsystem narrative, data-flow story). " +
-        "Use this as the FIRST tool when asked to write project documentation, a wiki, an " +
-        "architecture overview, or a 'what is this codebase' explanation. Saves ~20 exploratory " +
-        "tool calls vs. building the wiki from scratch via get_overview + cypher + read_code. " +
-        "Returns markdown — read the [AGENT FILLS] sections, do targeted read_code/get_definition " +
-        "calls to fill them, then write the final document. " +
+        "Use this when asked to write project documentation, a wiki, an architecture overview, " +
+        "or a 'what is this codebase' explanation — replaces the exploratory grep/find chain " +
+        "you'd otherwise run. Returns markdown. Read the [AGENT FILLS] sections, do targeted " +
+        "read_code/get_definition calls to fill them, then write the final document. " +
         "Tunable: pass maxCommunities and glossaryLimit to dial output size.",
       inputSchema,
     },
@@ -156,7 +155,10 @@ async function runGenerateWiki(
   ] = await Promise.all([
     readQuery(
       ctx,
-      `MATCH (r:Repository) RETURN r.name AS name, r.path AS path LIMIT 1`,
+      `MATCH (r:Repository)
+       RETURN r.name AS name, r.path AS path,
+              r.lastIndexed AS lastIndexed, r.lastCommit AS lastCommit
+       LIMIT 1`,
     ),
     readQuery(
       ctx,
@@ -269,6 +271,8 @@ async function runGenerateWiki(
   ]);
 
   const repo = repoRows[0] ?? { name: "(unknown)", path: "(unknown)" };
+  const repoLastIndexed = (repo.lastIndexed as string | undefined) ?? null;
+  const repoLastCommit = (repo.lastCommit as string | undefined) ?? null;
 
   const counts = countRows.map((r) => ({
     kind: String(r.kind),
@@ -363,6 +367,8 @@ async function runGenerateWiki(
     renderWiki({
       repoName: String(repo.name),
       repoPath: String(repo.path),
+      lastIndexed: repoLastIndexed,
+      lastCommit: repoLastCommit,
       counts,
       languages,
       communities,
@@ -383,6 +389,8 @@ async function runGenerateWiki(
 interface RenderInput {
   repoName: string;
   repoPath: string;
+  lastIndexed: string | null;
+  lastCommit: string | null;
   maxCommunities: number;
   counts: { kind: string; count: number }[];
   languages: { language: string; count: number }[];
@@ -429,6 +437,15 @@ function renderWiki(d: RenderInput): string {
   ): string => label ?? heuristic ?? `community-${id}`;
 
   out.push(`# Wiki for \`${d.repoName}\` (skeleton)`);
+  // Index-freshness signal — agents shouldn't trust a stale graph for
+  // current-state questions. Same pattern as get_overview.
+  const indexAge = describeAge(d.lastIndexed);
+  if (indexAge || d.lastCommit) {
+    const parts: string[] = [];
+    if (indexAge) parts.push(`indexed ${indexAge}`);
+    if (d.lastCommit) parts.push(`commit ${d.lastCommit.slice(0, 12)}`);
+    out.push(`> ${parts.join(" · ")}`);
+  }
   out.push("");
   out.push(`> ⚠️ This is a structural skeleton, not the final wiki. As the agent, you should:`);
   out.push("> 1. Synthesize the **Overview** section from the repo's README + project structure");
@@ -733,6 +750,28 @@ function renderWiki(d: RenderInput): string {
   }
 
   return out.join("\n");
+}
+
+/**
+ * Compact wall-clock age for an ISO timestamp ("3h ago", "2d ago", "5w ago").
+ * Mirror of the helper in get-overview.ts; kept inline since the surface is tiny.
+ */
+function describeAge(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return null;
+  const ms = Date.now() - ts;
+  if (ms < 60_000) return "just now";
+  const min = Math.floor(ms / 60_000);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 14) return `${day}d ago`;
+  const wk = Math.floor(day / 7);
+  if (wk < 8) return `${wk}w ago`;
+  const mo = Math.floor(day / 30);
+  return `${mo}mo ago`;
 }
 
 /**
