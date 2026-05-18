@@ -18,6 +18,8 @@ import {
   type IncrementalCtx,
 } from "./indexers/neo4j-incremental";
 import { clusterInNeo4j } from "./clustering/neo4j-leiden";
+import { runNeo4jSubcommand } from "./cli-commands/neo4j";
+import { runMcpInstall } from "./cli-commands/mcp-install";
 import { computeAndStoreEmbeddings } from "./embeddings/pipeline";
 import { search, type SearchMode } from "./search";
 import { startMcpServer } from "./mcp/server";
@@ -208,7 +210,15 @@ function printHelp(): void {
     `codelens - build a code graph from a repository (JS/TS/Java)
 
 Usage:
-  codelens <repo-path-or-git-url> [options]
+  codelens <subcommand> [args]
+  codelens <repo-path-or-git-url> [options]   (shorthand for: codelens index ...)
+
+Subcommands:
+  index <path>             Analyze + index a repo (default if no subcommand)
+  mcp                      Start the MCP server (stdio)
+  mcp install              Register the MCP server with Claude Code
+  neo4j start|stop|status|logs    Manage the bundled Neo4j docker container
+  help                     Show this help
 
   When given a git URL (https://, git@, ssh://), the tool clones into
   ~/.code-lens-aI/cache/<host>/<owner>/<name>/ and indexes from there.
@@ -261,24 +271,62 @@ MCP server mode (stdio; no <repo-path> needed):
   );
 }
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+// Subcommand dispatcher. Inspects argv[0]; falls through to legacy
+// bare-path/flags behavior (treated as `index`) when no known subcommand
+// is given. Keeps `--mcp` flag and bare-path forms working as aliases.
+const KNOWN_SUBCOMMANDS = new Set(["index", "mcp", "neo4j", "help"]);
 
-  // MCP server mode — no repo path needed; runs until killed.
-  if (args.mcp) {
-    if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
-      console.error(
-        "[codelens] --mcp requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
-      );
-      process.exit(2);
+async function runMcpServerFromArgs(args: CliArgs): Promise<void> {
+  if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
+    console.error(
+      "[codelens] mcp requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password " +
+        "or NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD env vars)",
+    );
+    process.exit(2);
+  }
+  await startMcpServer({
+    neo4jUri: args.neo4jUri,
+    neo4jUser: args.neo4jUser,
+    neo4jPassword: args.neo4jPassword,
+    neo4jDatabase: args.neo4jDatabase,
+  });
+}
+
+async function main(): Promise<void> {
+  const rawArgv = process.argv.slice(2);
+  const head = rawArgv[0];
+  const subcommand =
+    head && KNOWN_SUBCOMMANDS.has(head) ? head : null;
+  const tail = subcommand ? rawArgv.slice(1) : rawArgv;
+
+  if (subcommand === "help") {
+    printHelp();
+    process.exit(0);
+  }
+
+  if (subcommand === "neo4j") {
+    await runNeo4jSubcommand(tail);
+    return;
+  }
+
+  if (subcommand === "mcp") {
+    if (tail[0] === "install") {
+      await runMcpInstall(tail.slice(1));
+      return;
     }
-    await startMcpServer({
-      neo4jUri: args.neo4jUri,
-      neo4jUser: args.neo4jUser,
-      neo4jPassword: args.neo4jPassword,
-      neo4jDatabase: args.neo4jDatabase,
-    });
+    // `codelens mcp [--neo4j-uri ... --neo4j-user ... --neo4j-password ...]`
+    const args = parseArgs(tail);
+    await runMcpServerFromArgs(args);
     return; // server keeps process alive via stdio + signal handlers
+  }
+
+  // No subcommand, or `index`: parse flags and run the legacy pipeline.
+  const args = parseArgs(tail);
+
+  // Legacy --mcp flag (still supported as an alias for `codelens mcp`).
+  if (args.mcp) {
+    await runMcpServerFromArgs(args);
+    return;
   }
 
   // Cluster-only mode: skip analyze/index/embed/search; just re-cluster.
