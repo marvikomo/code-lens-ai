@@ -1,5 +1,5 @@
-import { SpatialCanvas } from "@/components/SpatialCanvas";
+import { Dashboard } from "@/components/Dashboard";
 
 export default function Home() {
-  return <SpatialCanvas />;
+  return <Dashboard />;
 }
