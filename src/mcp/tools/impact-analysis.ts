@@ -428,6 +428,20 @@ function renderImpactAnalysis(a: RenderArgs): string {
   out.push("");
   out.push(a.verdict.line);
   out.push("");
+  // File-level blast — broader signal than this symbol's caller set. Useful
+  // when the verdict says "safe" but the containing file is a hub: even
+  // unrelated edits to the file can ripple.
+  const blast = asNumber(a.targetFile?.properties.blastScore);
+  if (blast !== undefined && blast > 0) {
+    const direct = asNumber(a.targetFile?.properties.blastDirect) ?? 0;
+    const transitive = asNumber(a.targetFile?.properties.blastTransitive) ?? 0;
+    out.push(
+      `**Containing file blast=${Math.round(blast)}** ` +
+        `(${direct} direct importers, ${transitive} transitive) — ` +
+        `file-level ripple, broader than this symbol's caller set.`,
+    );
+    out.push("");
+  }
   out.push(
     "> Based on visible callers in the indexed graph. Low-confidence and dynamic callers are surfaced separately; still sanity-check before destructive edits.",
   );
