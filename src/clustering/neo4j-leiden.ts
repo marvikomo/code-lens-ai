@@ -91,7 +91,8 @@ export async function clusterInNeo4j(
     if (opts.clear) {
       await run(`MATCH (c:Community) DETACH DELETE c`);
       await run(
-        `MATCH (f:File) REMOVE f.community, f.pagerank, f.boundary, f.is_core`,
+        `MATCH (f:File) REMOVE f.community, f.pagerank, f.boundary, f.is_core,
+                                 f.blastDirect, f.blastTransitive, f.blastScore`,
       );
     }
 
@@ -142,6 +143,26 @@ export async function clusterInNeo4j(
        WHERE other.community <> f.community
        WITH f, count(DISTINCT other) AS boundary
        SET f.boundary = boundary`,
+    );
+
+    // 6b. Blast radius — how many files break (directly or transitively) if
+    //     this file changes. Counts files that IMPORT this one (directed),
+    //     unlike Leiden which projects undirected. Formula matches codeindex
+    //     so numbers are comparable across tools:
+    //       blastScore = directCount + 0.5 * transitiveCount
+    //     where direct = importers in one hop, transitive = importers reachable
+    //     in 2..8 hops (capping at 8 keeps the traversal bounded on large
+    //     monorepos — beyond 8 hops "depends on" stops being a meaningful
+    //     signal anyway). Files with no importers get blastScore = 0.
+    await run(
+      `MATCH (f:File)
+       OPTIONAL MATCH (direct:File)-[:IMPORTS]->(f)
+       WITH f, count(DISTINCT direct) AS directCount
+       OPTIONAL MATCH (transitive:File)-[:IMPORTS*1..8]->(f)
+       WITH f, directCount, count(DISTINCT transitive) AS totalCount
+       SET f.blastDirect = directCount,
+           f.blastTransitive = totalCount - directCount,
+           f.blastScore = toFloat(directCount) + 0.5 * toFloat(totalCount - directCount)`,
     );
 
     // 7. Per-community spine — top-K PageRank, then top-M boundary (additive).

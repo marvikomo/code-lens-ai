@@ -154,6 +154,7 @@ async function runGenerateWiki(
     glossaryRows,
     externalRows,
     coverageRows,
+    topBlastRows,
   ] = await Promise.all([
     readQuery(
       ctx,
@@ -277,6 +278,27 @@ async function runGenerateWiki(
        RETURN total, clustered,
               [p IN rawOrphans WHERE p IS NOT NULL] AS orphans`,
     ),
+    // Top-15 by blast — high-blast file rendering, see get-overview.ts for
+    // the formula commentary. Adjacent to Entry points in the wiki so readers
+    // see the contrast: high-blast = "files everyone leans on";
+    // entry points = "files no one imports."
+    readQuery(
+      ctx,
+      `MATCH (f:File)
+       WHERE f.blastScore IS NOT NULL AND f.blastScore > 0
+       OPTIONAL MATCH (f)-[:IN_COMMUNITY]->(c:Community)
+       RETURN f.path AS path,
+              f.blastScore AS blast,
+              f.blastDirect AS direct,
+              f.blastTransitive AS transitive,
+              f.is_core AS isSpine,
+              coalesce(c.label, c.heuristicLabel,
+                       CASE WHEN c.communityId IS NOT NULL
+                            THEN 'community-' + toString(c.communityId)
+                            ELSE '(no community)' END) AS community
+       ORDER BY f.blastScore DESC
+       LIMIT 15`,
+    ),
   ]);
 
   const repo = repoRows[0] ?? { name: "(unknown)", path: "(unknown)" };
@@ -378,6 +400,15 @@ async function runGenerateWiki(
       : [],
   };
 
+  const topBlast: BlastFile[] = topBlastRows.map((r) => ({
+    path: String(r.path ?? ""),
+    blast: asNumber(r.blast) ?? 0,
+    direct: asNumber(r.direct) ?? 0,
+    transitive: asNumber(r.transitive) ?? 0,
+    isSpine: Boolean(r.isSpine),
+    community: (r.community as string | null) ?? "(no community)",
+  }));
+
   return textResult(
     renderWiki({
       repoName: String(repo.name),
@@ -396,9 +427,19 @@ async function runGenerateWiki(
       glossary,
       externals,
       coverage,
+      topBlast,
       maxCommunities,
     }),
   );
+}
+
+interface BlastFile {
+  path: string;
+  blast: number;
+  direct: number;
+  transitive: number;
+  isSpine: boolean;
+  community: string;
 }
 
 interface RenderInput {
@@ -419,6 +460,7 @@ interface RenderInput {
   glossary: GlossaryEntry[];
   externals: ExternalImport[];
   coverage: CoverageStats;
+  topBlast: BlastFile[];
 }
 
 function renderWiki(d: RenderInput): string {
@@ -715,6 +757,31 @@ function renderWiki(d: RenderInput): string {
   }
 
   // ─── Entry points ──────────────────────────────────────────────────────
+  out.push(SECTION_DIVIDER);
+  // ─── High-blast files ─────────────────────────────────────────────────
+  if (d.topBlast.length > 0) {
+    out.push(SECTION_DIVIDER);
+    out.push("## High-blast files");
+    out.push("");
+    out.push(
+      "Files whose modification ripples widest through the codebase. " +
+        "Score = direct importers + 0.5 × transitive importers (up to 8 hops). " +
+        "Antonym of Entry points below: high-blast = files everyone leans on; " +
+        "entry points = files no one leans on.",
+    );
+    out.push("");
+    out.push("| Rank | File | Blast | Direct | Transitive | Community |");
+    out.push("|---|---|---|---|---|---|");
+    d.topBlast.forEach((b, i) => {
+      const spineMark = b.isSpine ? " ★" : "";
+      out.push(
+        `| ${i + 1} | \`${rel(b.path)}\`${spineMark} | ${Math.round(b.blast)} | ${b.direct} | ${b.transitive} | ${b.community} |`,
+      );
+    });
+    out.push("");
+    out.push("> ★ = also a spine file in its community.");
+  }
+
   out.push(SECTION_DIVIDER);
   out.push("## Entry points");
   out.push("");

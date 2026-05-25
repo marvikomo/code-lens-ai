@@ -205,7 +205,7 @@ export function registerGetOverview(
       inputSchema: {},
     },
     async () => {
-      const [counts, languages, communities, repoRows] = await Promise.all([
+      const [counts, languages, communities, repoRows, topBlast] = await Promise.all([
         readQuery(
           ctx,
           `MATCH (n:CodeNode)
@@ -227,13 +227,16 @@ export function registerGetOverview(
           // + CURRENT spine paths AND content hashes — for the hash-based
           // staleness detector that distinguishes "spine drifted" (path
           // changes) from "spine content drifted" (file rewritten in place).
+          // spineBlasts is a parallel array to spinePaths, indexed identically;
+          // null for files that pre-date the blast-radius pass.
           `MATCH (c:Community)<-[:IN_COMMUNITY]-(f:File)
            OPTIONAL MATCH (c)<-[:IN_COMMUNITY]-(spine:File {is_core: true})
            WITH c, count(DISTINCT f) AS size,
-                collect(DISTINCT { path: spine.path, hash: spine.contentHash }) AS spineInfo,
+                collect(DISTINCT { path: spine.path, hash: spine.contentHash, blast: spine.blastScore }) AS spineInfo,
                 collect(DISTINCT f.path)[..3] AS samplePaths
            WITH c, size, samplePaths,
                 [x IN spineInfo WHERE x.path IS NOT NULL | x.path][..6] AS spinePaths,
+                [x IN spineInfo WHERE x.path IS NOT NULL | x.blast][..6] AS spineBlasts,
                 [x IN spineInfo WHERE x.path IS NOT NULL | x.path] AS allCurrentSpinePaths,
                 [x IN spineInfo WHERE x.path IS NOT NULL | coalesce(x.hash, '')] AS allCurrentSpineHashes
            RETURN c.communityId AS id,
@@ -243,7 +246,7 @@ export function registerGetOverview(
                   c.descriptionWrittenAt AS descriptionWrittenAt,
                   c.descriptionSpineSnapshot AS descriptionSpineSnapshot,
                   c.descriptionSpineHashes AS descriptionSpineHashes,
-                  size, spinePaths, samplePaths,
+                  size, spinePaths, spineBlasts, samplePaths,
                   allCurrentSpinePaths, allCurrentSpineHashes
            ORDER BY size DESC LIMIT 12`,
         ),
@@ -253,6 +256,28 @@ export function registerGetOverview(
            RETURN r.path AS path, r.lastIndexed AS lastIndexed,
                   r.lastCommit AS lastCommit
            LIMIT 1`,
+        ),
+        // Top-10 by blast — files whose change ripples widest. Distinct from
+        // spine (which is centrality WITHIN a community); high-blast files
+        // are damage potential ACROSS the whole graph. Often overlapping but
+        // the non-overlaps are interesting: a high-blast non-spine file is
+        // "boring utility everyone imports."
+        readQuery(
+          ctx,
+          `MATCH (f:File)
+           WHERE f.blastScore IS NOT NULL AND f.blastScore > 0
+           OPTIONAL MATCH (f)-[:IN_COMMUNITY]->(c:Community)
+           RETURN f.path AS path,
+                  f.blastScore AS blast,
+                  f.blastDirect AS direct,
+                  f.blastTransitive AS transitive,
+                  f.is_core AS isSpine,
+                  coalesce(c.label, c.heuristicLabel,
+                           CASE WHEN c.communityId IS NOT NULL
+                                THEN 'community-' + toString(c.communityId)
+                                ELSE '(no community)' END) AS community
+           ORDER BY f.blastScore DESC
+           LIMIT 10`,
         ),
       ]);
 
@@ -293,6 +318,31 @@ export function registerGetOverview(
         out.push(`- ${r.language}: ${asNumber(r.count)}`);
       }
       out.push("");
+      if (topBlast.length > 0) {
+        out.push("## High-blast files (top 10 — changes ripple widely)");
+        out.push("");
+        out.push(
+          "> Files whose modification breaks the most other files. Score = " +
+            "direct importers + 0.5 × transitive importers (up to 8 hops). When " +
+            "refactoring these, plan extra testing — `impact_analysis` gives the " +
+            "precise caller set.",
+        );
+        out.push("");
+        for (const b of topBlast) {
+          const path = rel((b.path as string) ?? "");
+          const blast = asNumber(b.blast) ?? 0;
+          const direct = asNumber(b.direct) ?? 0;
+          const transitive = asNumber(b.transitive) ?? 0;
+          const community = (b.community as string | null) ?? "(no community)";
+          const isSpine = Boolean(b.isSpine);
+          const spineMark = isSpine ? " ★ spine" : "";
+          out.push(
+            `- ${path}  blast=${Math.round(blast)}  ` +
+              `(${direct} direct, ${transitive} transitive) · ${community}${spineMark}`,
+          );
+        }
+        out.push("");
+      }
       if (communities.length === 0) {
         out.push(
           "## Communities\n(none — run `--cluster` to detect architectural subsystems)",
@@ -350,7 +400,15 @@ export function registerGetOverview(
           const currentSpinePathsAll = stringArr(r.allCurrentSpinePaths);
           const currentSpineHashesAll = stringArr(r.allCurrentSpineHashes);
 
-          const spinePaths = ((r.spinePaths as string[]) ?? []).map(rel);
+          const spinePathsRaw = ((r.spinePaths as string[]) ?? []).map(rel);
+          const spineBlastsRaw = (r.spineBlasts as unknown[]) ?? [];
+          // Zip spine paths with blast for inline rendering. Skip blast on
+          // files where it's missing or zero — keeps the line uncluttered for
+          // isolated files where the score adds no signal.
+          const spinePaths = spinePathsRaw.map((p, i) => {
+            const b = asNumber(spineBlastsRaw[i]) ?? 0;
+            return b > 0 ? `${p} (blast=${Math.round(b)})` : p;
+          });
           const samplePaths = ((r.samplePaths as string[]) ?? []).map(rel);
 
           // Compute freshness first — if invalidated, we suppress the label
