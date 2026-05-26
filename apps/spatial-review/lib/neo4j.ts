@@ -66,7 +66,7 @@ export async function listIndexedRepos(): Promise<IndexedRepo[]> {
                 r.lastIndexed AS lastIndexed,
                 fileCount,
                 count(DISTINCT c) AS communityCount
-         ORDER BY r.lastIndexed DESC NULLS LAST`,
+         ORDER BY coalesce(r.lastIndexed, '') DESC`,
       ),
     );
     return res.records.map((rec) => ({

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { GitHubRepo } from "@/lib/github";
 import type { IndexedRepo } from "@/lib/neo4j";
 
@@ -12,6 +12,21 @@ interface DashboardState {
   loading: boolean;
 }
 
+interface IndexingState {
+  // Repo full-name → live indexing state. Only one active at a time in v0
+  // (the CLI writes to a single Neo4j, so parallel indexes would race), but
+  // the data shape supports concurrency for later.
+  active: Map<string, IndexingProgress>;
+}
+
+interface IndexingProgress {
+  lines: string[];
+  status: "running" | "done" | "error";
+  /** Set when status !== running. */
+  finalMessage?: string;
+  elapsedMs?: number;
+}
+
 const INITIAL: DashboardState = {
   githubRepos: [],
   indexedRepos: [],
@@ -20,33 +35,95 @@ const INITIAL: DashboardState = {
   loading: true,
 };
 
+const PAGE_SIZE = 30;
+
 export function Dashboard() {
   const [state, setState] = useState<DashboardState>(INITIAL);
+  const [indexing, setIndexing] = useState<IndexingState>({ active: new Map() });
+  // "Available to index" — paginate + filter. The full list can be hundreds
+  // of repos; showing 30 at a time + a name-filter keeps the page usable.
+  const [availableLimit, setAvailableLimit] = useState(PAGE_SIZE);
+  const [availableFilter, setAvailableFilter] = useState("");
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const [githubRes, neo4jRes] = await Promise.allSettled([
-        fetch("/api/github/repos").then(asJson),
-        fetch("/api/neo4j/repos").then(asJson),
-      ]);
-      if (cancelled) return;
-      setState({
-        githubRepos: pluck(githubRes, "repos") ?? [],
-        indexedRepos: pluck(neo4jRes, "repos") ?? [],
-        githubError: pluckError(githubRes),
-        neo4jError: pluckError(neo4jRes),
-        loading: false,
-      });
-    })();
-    return () => {
-      cancelled = true;
-    };
+  const refresh = useCallback(async () => {
+    const [githubRes, neo4jRes] = await Promise.allSettled([
+      fetch("/api/github/repos").then(asJson),
+      fetch("/api/neo4j/repos").then(asJson),
+    ]);
+    setState({
+      githubRepos: pluck(githubRes, "repos") ?? [],
+      indexedRepos: pluck(neo4jRes, "repos") ?? [],
+      githubError: pluckError(githubRes),
+      neo4jError: pluckError(neo4jRes),
+      loading: false,
+    });
   }, []);
 
-  // Match GitHub repos to indexed repos by full_name OR by path basename
-  // OR by sourceUrl. The matching is fuzzy because indexed repos may have
-  // been indexed from a local clone (path-only) without a sourceUrl.
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const startIndexing = useCallback(
+    async (owner: string, name: string) => {
+      const key = `${owner}/${name}`;
+      // Optimistically place into the indexing map so the UI flips
+      // immediately on click. The fetch+stream takes over from there.
+      setIndexing((prev) => {
+        const next = new Map(prev.active);
+        next.set(key, { lines: [`Starting index of ${key}...`], status: "running" });
+        return { active: next };
+      });
+
+      try {
+        const res = await fetch(`/api/index/${owner}/${name}`, {
+          method: "POST",
+        });
+        if (!res.ok || !res.body) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          // SSE frames are separated by \n\n.
+          let frameEnd = buf.indexOf("\n\n");
+          while (frameEnd >= 0) {
+            const frame = buf.slice(0, frameEnd);
+            buf = buf.slice(frameEnd + 2);
+            handleSseFrame(key, frame, setIndexing, refresh);
+            frameEnd = buf.indexOf("\n\n");
+          }
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setIndexing((prev) => {
+          const next = new Map(prev.active);
+          const cur = next.get(key) ?? { lines: [], status: "running" as const };
+          next.set(key, {
+            ...cur,
+            lines: [...cur.lines, `error: ${message}`],
+            status: "error",
+            finalMessage: message,
+          });
+          return { active: next };
+        });
+      }
+    },
+    [refresh],
+  );
+
+  const dismissIndexing = useCallback((key: string) => {
+    setIndexing((prev) => {
+      const next = new Map(prev.active);
+      next.delete(key);
+      return { active: next };
+    });
+  }, []);
+
+  // Repo classification.
   const indexedSet = buildIndexedLookup(state.indexedRepos);
   const indexed: GitHubRepo[] = [];
   const available: GitHubRepo[] = [];
@@ -57,17 +134,18 @@ export function Dashboard() {
       available.push(r);
     }
   }
-
-  // Orphan-indexed: repos in Neo4j we couldn't match to any GitHub repo (e.g.
-  // indexed from a local clone that doesn't correspond to a GitHub repo, or
-  // a repo from an org the PAT doesn't have access to). Surface these so the
-  // user knows they exist.
   const matchedNames = new Set<string>([
     ...indexed.map((r) => r.fullName),
     ...indexed.map((r) => r.name),
   ]);
   const orphanIndexed = state.indexedRepos.filter(
     (r) => !matchedNames.has(r.name),
+  );
+
+  // Is anything currently running? Disables "Index" on other cards (we
+  // serialize because parallel indexes against one Neo4j would conflict).
+  const anyRunning = [...indexing.active.values()].some(
+    (p) => p.status === "running",
   );
 
   return (
@@ -94,7 +172,7 @@ export function Dashboard() {
         <ErrorCard
           title="Neo4j connection failed"
           message={state.neo4jError}
-          hint="Check that NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD are set in .env.local, and that Neo4j is running (`codelens neo4j start` or `docker compose up neo4j` in the parent CLI project)."
+          hint="Check that NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD are set in .env.local, and that Neo4j is running (`codelens neo4j start`)."
         />
       )}
 
@@ -119,7 +197,7 @@ export function Dashboard() {
       {!state.loading && orphanIndexed.length > 0 && (
         <Section
           title="Indexed (not matched to a GitHub repo)"
-          subtitle="These were indexed locally but we couldn't match them to any GitHub repo your token has access to. You can still browse them — PR features won't be available."
+          subtitle="Indexed locally but the token doesn't have access to a matching GitHub repo. Canvas works; PR features won't."
         >
           <div className="repo-grid">
             {orphanIndexed.map((r) => (
@@ -132,18 +210,66 @@ export function Dashboard() {
       {!state.loading && available.length > 0 && (
         <Section
           title="Available to index"
-          subtitle={`${available.length} GitHub repo${available.length === 1 ? "" : "s"} not yet indexed. Indexing UI ships in Day 2; for now use the CLI: \`codelens index /path/to/local/clone --cluster\``}
+          subtitle={`${available.length} repo${available.length === 1 ? "" : "s"} not yet indexed. Indexing happens in this browser session via the parent CLI — large repos take minutes.`}
         >
-          <div className="repo-grid">
-            {available.slice(0, 30).map((r) => (
-              <RepoCard key={r.fullName} repo={r} indexed={false} />
-            ))}
-          </div>
-          {available.length > 30 && (
-            <p className="dash-status">
-              … {available.length - 30} more not shown.
-            </p>
-          )}
+          <input
+            className="repo-filter"
+            type="search"
+            placeholder="Filter by name…"
+            value={availableFilter}
+            onChange={(e) => {
+              setAvailableFilter(e.target.value);
+              setAvailableLimit(PAGE_SIZE);
+            }}
+          />
+          {(() => {
+            const filter = availableFilter.trim().toLowerCase();
+            const filtered = filter
+              ? available.filter((r) =>
+                  r.fullName.toLowerCase().includes(filter),
+                )
+              : available;
+            const shown = filtered.slice(0, availableLimit);
+            const remaining = filtered.length - shown.length;
+            return (
+              <>
+                <div className="repo-grid">
+                  {shown.map((r) => {
+                    const key = r.fullName;
+                    const progress = indexing.active.get(key);
+                    return (
+                      <RepoCard
+                        key={key}
+                        repo={r}
+                        indexed={false}
+                        progress={progress}
+                        disableIndex={anyRunning && !progress}
+                        onIndex={() => startIndexing(r.owner, r.name)}
+                        onDismissProgress={() => dismissIndexing(key)}
+                      />
+                    );
+                  })}
+                </div>
+                {filtered.length === 0 && (
+                  <p className="dash-status">
+                    No repos match &ldquo;{availableFilter}&rdquo;.
+                  </p>
+                )}
+                {remaining > 0 && (
+                  <div className="show-more">
+                    <button
+                      onClick={() =>
+                        setAvailableLimit((l) => l + PAGE_SIZE)
+                      }
+                    >
+                      Show {Math.min(remaining, PAGE_SIZE)} more (
+                      {remaining} not shown)
+                    </button>
+                  </div>
+                )}
+              </>
+            );
+          })()}
         </Section>
       )}
 
@@ -156,16 +282,59 @@ export function Dashboard() {
           <div className="empty">
             <p>No repos found.</p>
             <p>
-              Either your GitHub token has no accessible repos, or Neo4j has
-              no indexed repos yet. Run{" "}
-              <code>codelens index /path/to/repo --cluster</code> in the parent
-              CLI project to get started.
+              Your GitHub token has no accessible repos and Neo4j has no
+              indexed repos yet.
             </p>
           </div>
         )}
     </div>
   );
 }
+
+// ---------- SSE frame parser ----------
+
+function handleSseFrame(
+  key: string,
+  frame: string,
+  setIndexing: React.Dispatch<React.SetStateAction<IndexingState>>,
+  refresh: () => Promise<void>,
+): void {
+  // Frame is e.g. "event: log\ndata: some line"
+  const lines = frame.split("\n");
+  let event = "message";
+  let data = "";
+  for (const l of lines) {
+    if (l.startsWith("event: ")) event = l.slice(7);
+    else if (l.startsWith("data: ")) data = l.slice(6);
+  }
+
+  setIndexing((prev) => {
+    const next = new Map(prev.active);
+    const cur = next.get(key) ?? { lines: [], status: "running" as const };
+    if (event === "log") {
+      next.set(key, { ...cur, lines: [...cur.lines, data].slice(-200) });
+    } else if (event === "done") {
+      next.set(key, {
+        ...cur,
+        lines: [...cur.lines, data].slice(-200),
+        status: "done",
+        finalMessage: data,
+      });
+      // After a successful index, refresh so it moves to "Indexed" section.
+      void refresh();
+    } else if (event === "error") {
+      next.set(key, {
+        ...cur,
+        lines: [...cur.lines, `error: ${data}`].slice(-200),
+        status: "error",
+        finalMessage: data,
+      });
+    }
+    return { active: next };
+  });
+}
+
+// ---------- Subcomponents ----------
 
 function Section({
   title,
@@ -191,15 +360,22 @@ function RepoCard({
   repo,
   indexed,
   indexedMeta,
+  progress,
+  disableIndex,
+  onIndex,
+  onDismissProgress,
 }: {
   repo: GitHubRepo;
   indexed: boolean;
   indexedMeta?: IndexedRepo;
+  progress?: IndexingProgress;
+  disableIndex?: boolean;
+  onIndex?: () => void;
+  onDismissProgress?: () => void;
 }) {
-  // Click target only meaningful when indexed — non-indexed cards are
-  // placeholders for the "Index" button that ships in Day 2.
-  const Tag = indexed ? "a" : "div";
-  const href = indexed
+  const showCardLink = indexed && !progress;
+  const Tag = showCardLink ? "a" : "div";
+  const href = showCardLink
     ? `/repo/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`
     : undefined;
   return (
@@ -222,12 +398,65 @@ function RepoCard({
           </>
         )}
       </div>
-      {!indexed && (
-        <button className="index-btn" disabled title="Day 2 wiring">
-          Index (Day 2)
+      {!indexed && !progress && (
+        <button
+          className="index-btn"
+          disabled={disableIndex}
+          title={
+            disableIndex
+              ? "Another index is running — only one at a time"
+              : "Clone + index this repo (takes minutes for large repos)"
+          }
+          onClick={(e) => {
+            e.preventDefault();
+            onIndex?.();
+          }}
+        >
+          Index
         </button>
       )}
+      {progress && (
+        <IndexingPanel progress={progress} onDismiss={onDismissProgress} />
+      )}
     </Tag>
+  );
+}
+
+function IndexingPanel({
+  progress,
+  onDismiss,
+}: {
+  progress: IndexingProgress;
+  onDismiss?: () => void;
+}) {
+  const logRef = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    if (logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [progress.lines.length]);
+
+  const statusLabel =
+    progress.status === "running"
+      ? "Indexing…"
+      : progress.status === "done"
+        ? "Done"
+        : "Error";
+
+  return (
+    <div className="indexing-panel" data-status={progress.status}>
+      <div className="indexing-head">
+        <span>{statusLabel}</span>
+        {(progress.status === "done" || progress.status === "error") && (
+          <button className="dismiss-btn" onClick={onDismiss}>
+            dismiss
+          </button>
+        )}
+      </div>
+      <pre ref={logRef} className="indexing-log">
+        {progress.lines.join("\n")}
+      </pre>
+    </div>
   );
 }
 
@@ -290,7 +519,6 @@ function pluckError(s: PromiseSettledResult<unknown>): string | null {
     const r = s.reason as unknown;
     return r instanceof Error ? r.message : String(r);
   }
-  // Fulfilled but server returned { error }
   const obj = s.value as Record<string, unknown> | undefined;
   if (obj && typeof obj.error === "string") return obj.error;
   return null;
