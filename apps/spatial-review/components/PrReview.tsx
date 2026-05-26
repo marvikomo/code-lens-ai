@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import type { ReadingPath, ReadingPathEntry } from "@/lib/reading-path";
 import { PrCanvas } from "./PrCanvas";
+import { ReaderPane } from "./ReaderPane";
 
 interface ApiResponse extends ReadingPath {
   prFileCount: number;
@@ -31,6 +32,16 @@ export function PrReview({
     loading: true,
   });
   const [focusedPath, setFocusedPath] = useState<string | null>(null);
+  const [readerOpen, setReaderOpen] = useState(false);
+
+  // Open the reader on any click — sidebar row or canvas node. Esc / X
+  // closes; focusedPath persists so the right pane still shows context
+  // until the next click.
+  const openReader = useCallback((path: string) => {
+    setFocusedPath(path);
+    setReaderOpen(true);
+  }, []);
+  const closeReader = useCallback(() => setReaderOpen(false), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,10 +77,6 @@ export function PrReview({
       cancelled = true;
     };
   }, [owner, repo, number]);
-
-  const onFocusFromCanvas = useCallback((matchedPath: string) => {
-    setFocusedPath(matchedPath);
-  }, []);
 
   const focused =
     state.data?.entries.find((e) => e.matchedPath === focusedPath) ?? null;
@@ -174,7 +181,7 @@ export function PrReview({
                 entries={state.data.entries}
                 edges={state.data.edges}
                 focusedPath={focusedPath}
-                onFocus={onFocusFromCanvas}
+                onFocus={openReader}
               />
 
               <aside className="rp-focus-pane">
@@ -191,11 +198,20 @@ export function PrReview({
                   />
                 ) : (
                   <div className="rp-focus-content empty">
-                    Click a file to focus.
+                    Click any file to open the reader.
                   </div>
                 )}
               </aside>
             </div>
+          )}
+          {readerOpen && focused && state.data && (
+            <ReaderPane
+              entries={state.data.entries}
+              edges={state.data.edges}
+              focusedPath={focused.matchedPath}
+              onClose={closeReader}
+              onNavigate={(p) => setFocusedPath(p)}
+            />
           )}
         </>
       )}

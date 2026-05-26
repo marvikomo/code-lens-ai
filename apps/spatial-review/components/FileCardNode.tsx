@@ -8,6 +8,11 @@ type FileCardNodeType = Node<
   "fileCard"
 >;
 
+/**
+ * Compact metadata card — overview view. The actual diff lives in the reader
+ * pane (overlay), opened by clicking this card. Keeping the card small lets
+ * the canvas hold many files on screen at once for spatial overview.
+ */
 export function FileCardNode({ data, selected }: NodeProps<FileCardNodeType>) {
   const basename = data.matchedPath.split("/").slice(-1)[0] ?? data.matchedPath;
   const dir = data.matchedPath.slice(
@@ -17,7 +22,7 @@ export function FileCardNode({ data, selected }: NodeProps<FileCardNodeType>) {
 
   return (
     <div
-      className="file-card"
+      className="file-card compact"
       data-entry={data.isEntry || undefined}
       data-spine={data.isSpine || undefined}
       data-selected={selected || undefined}
@@ -33,33 +38,6 @@ export function FileCardNode({ data, selected }: NodeProps<FileCardNodeType>) {
         </div>
       </div>
       {dir && <div className="fc-dir">{dir}</div>}
-
-      {/* Diff body — scrollable + non-drag/non-wheel so it doesn't fight
-          xyflow's pan/drag. Empty when GitHub returned no patch (binary,
-          too large, or status=removed). */}
-      {data.diff.length > 0 ? (
-        <pre className="fc-diff nodrag nowheel">
-          {data.diff.map((line, i) => (
-            <div key={i} className={`fc-line fc-line-${line.kind}`}>
-              <span className="fc-gutter">
-                {line.kind === "added"
-                  ? "+"
-                  : line.kind === "removed"
-                    ? "−"
-                    : line.kind === "hunk-separator"
-                      ? "⋯"
-                      : " "}
-              </span>
-              <code>{line.text || " "}</code>
-            </div>
-          ))}
-        </pre>
-      ) : (
-        <div className="fc-no-diff">
-          (no diff — binary file, too large, or status: {data.status})
-        </div>
-      )}
-
       <div className="fc-meta">
         <span className="fc-stats">
           {data.additions > 0 && (
@@ -76,6 +54,7 @@ export function FileCardNode({ data, selected }: NodeProps<FileCardNodeType>) {
           <span className="fc-blast">blast {Math.round(data.blastScore)}</span>
         )}
       </div>
+      <div className="fc-cta">Click to read →</div>
       <Handle type="source" position={Position.Right} className="fc-handle" />
     </div>
   );

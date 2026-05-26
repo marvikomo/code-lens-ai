@@ -26,14 +26,12 @@ const nodeTypes: NodeTypes = {
 // * (cardHeight + gap), centered vertically per column. Echoes the BFS
 // ordering visually — entry points on the left, deps to the right.
 //
-// Card height is approximate — actual rendered height depends on diff
-// length (scrolls internally past CARD_HEIGHT). The constant determines
-// vertical spacing in the layout, not the rendered height. Slightly
-// undersized constant = tighter packing, with diffs scrolling internally.
-const CARD_WIDTH = 420;
-const CARD_HEIGHT = 280;
-const COL_GAP = 120;
-const ROW_GAP = 40;
+// Compact card geometry — reading happens in the reader pane overlay, not
+// inside the card. Smaller cards = more files visible at once on the canvas.
+const CARD_WIDTH = 280;
+const CARD_HEIGHT = 110;
+const COL_GAP = 80;
+const ROW_GAP = 24;
 
 function layout(entries: ReadingPathEntry[]): Map<string, { x: number; y: number }> {
   const byLevel = new Map<number, ReadingPathEntry[]>();
