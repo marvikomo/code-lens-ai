@@ -1826,6 +1826,226 @@ body > div {
   background: #e0e7ff;
   color: #3730a3;
 }
+.rp-tag.draft-pr {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+/* ---------- PR meta in review header ---------- */
+.pr-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 4px;
+  flex-wrap: wrap;
+}
+
+.pr-headline {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: #0f172a;
+  line-height: 1.3;
+  min-width: 0;
+}
+
+.pr-external {
+  margin-left: auto;
+  font-size: 11px;
+  color: #64748b;
+  text-decoration: none;
+  padding: 3px 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.pr-external:hover {
+  color: #1e40af;
+  border-color: #3b82f6;
+}
+
+.pr-byline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 11px;
+  color: #64748b;
+  margin-bottom: 8px;
+}
+
+.pr-byline strong {
+  color: #0f172a;
+  font-weight: 600;
+}
+
+.pr-byline code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #f1f5f9;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  color: #475569;
+}
+
+.pr-byline .dot {
+  color: #cbd5e1;
+}
+
+.pr-description,
+.pr-commits {
+  margin-top: 6px;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.pr-description summary,
+.pr-commits summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  user-select: none;
+  background: #f8fafc;
+  border-bottom: 1px solid transparent;
+  list-style: none;
+}
+
+.pr-description summary::-webkit-details-marker,
+.pr-commits summary::-webkit-details-marker {
+  display: none;
+}
+
+.pr-description summary::before,
+.pr-commits summary::before {
+  content: "▸";
+  color: #94a3b8;
+  font-size: 10px;
+  transition: transform 0.1s;
+}
+
+.pr-description[open] summary::before,
+.pr-commits[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.pr-description[open] summary,
+.pr-commits[open] summary {
+  border-bottom-color: #e2e8f0;
+}
+
+.pr-description summary:hover,
+.pr-commits summary:hover {
+  background: #f1f5f9;
+}
+
+.pr-block-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #475569;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.pr-block-hint {
+  font-size: 10px;
+  color: #94a3b8;
+  margin-left: auto;
+}
+
+.pr-description-body {
+  margin: 0;
+  padding: 12px 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #334155;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+  background: #ffffff;
+}
+
+.pr-commit-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px 0;
+  background: #ffffff;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.pr-commit {
+  display: flex;
+  gap: 10px;
+  padding: 6px 14px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.pr-commit:first-child {
+  border-top: none;
+}
+
+.pr-commit-sha {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #64748b;
+  background: #f1f5f9;
+  padding: 2px 6px;
+  border-radius: 3px;
+  height: fit-content;
+  flex-shrink: 0;
+}
+
+.pr-commit-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.pr-commit-subject {
+  font-size: 12px;
+  font-weight: 500;
+  color: #0f172a;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.pr-commit-msg-body {
+  margin: 4px 0 0;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #475569;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: transparent;
+}
+
+.pr-commit-meta {
+  margin-top: 3px;
+  font-size: 10px;
+  color: #94a3b8;
+}
+
+.pr-meta-error {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #7f1d1d;
+}
+
+.pr-meta-error code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: transparent;
+}
 
 .reader-no-diff {
   padding: 24px;

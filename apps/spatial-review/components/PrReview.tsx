@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import type { ReadingPath, ReadingPathEntry } from "@/lib/reading-path";
+import type { PrMeta, PrCommit } from "@/lib/github";
 import { PrCanvas } from "./PrCanvas";
 import { ReaderPane } from "./ReaderPane";
 
@@ -11,10 +12,21 @@ interface ApiResponse extends ReadingPath {
   error?: string;
 }
 
+interface MetaResponse {
+  pr: PrMeta;
+  commits: PrCommit[];
+  error?: string;
+}
+
 interface State {
   data: ApiResponse | null;
   error: string | null;
   loading: boolean;
+}
+
+interface MetaState {
+  data: MetaResponse | null;
+  error: string | null;
 }
 
 export function PrReview({
@@ -31,6 +43,9 @@ export function PrReview({
     error: null,
     loading: true,
   });
+  const [meta, setMeta] = useState<MetaState>({ data: null, error: null });
+  const [contextOpen, setContextOpen] = useState(false);
+  const [commitsOpen, setCommitsOpen] = useState(false);
   const [focusedPath, setFocusedPath] = useState<string | null>(null);
   const [readerOpen, setReaderOpen] = useState(false);
 
@@ -46,30 +61,63 @@ export function PrReview({
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      try {
-        const res = await fetch(
+      // Fetch reading-path + PR meta in parallel. The reading path drives
+      // the canvas; meta drives the header (title / description / commits).
+      // We render meta as soon as it arrives — don't gate the canvas on it.
+      const [pathRes, metaRes] = await Promise.allSettled([
+        fetch(
           `/api/pr/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/reading-path`,
-        );
-        const body = (await res.json()) as ApiResponse;
-        if (cancelled) return;
-        if (!res.ok || body.error) {
+        ).then(asJsonResponse),
+        fetch(
+          `/api/pr/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/meta`,
+        ).then(asJsonResponse),
+      ]);
+      if (cancelled) return;
+
+      if (pathRes.status === "fulfilled") {
+        const { ok, body } = pathRes.value;
+        const parsed = body as ApiResponse;
+        if (!ok || parsed.error) {
           setState({
             data: null,
-            error: body.error ?? `HTTP ${res.status}`,
+            error: parsed.error ?? "Failed to load reading path",
             loading: false,
           });
         } else {
-          setState({ data: body, error: null, loading: false });
-          if (body.entries.length > 0) {
-            setFocusedPath(body.entries[0].matchedPath);
+          setState({ data: parsed, error: null, loading: false });
+          if (parsed.entries.length > 0) {
+            setFocusedPath(parsed.entries[0].matchedPath);
           }
         }
-      } catch (err) {
-        if (cancelled) return;
+      } else {
         setState({
           data: null,
-          error: err instanceof Error ? err.message : String(err),
+          error:
+            pathRes.reason instanceof Error
+              ? pathRes.reason.message
+              : String(pathRes.reason),
           loading: false,
+        });
+      }
+
+      if (metaRes.status === "fulfilled") {
+        const { ok, body } = metaRes.value;
+        const parsed = body as MetaResponse;
+        if (!ok || parsed.error) {
+          setMeta({
+            data: null,
+            error: parsed.error ?? "Failed to load PR metadata",
+          });
+        } else {
+          setMeta({ data: parsed, error: null });
+        }
+      } else {
+        setMeta({
+          data: null,
+          error:
+            metaRes.reason instanceof Error
+              ? metaRes.reason.message
+              : String(metaRes.reason),
         });
       }
     })();
@@ -90,13 +138,109 @@ export function PrReview({
         >
           ← back to {owner}/{repo}
         </Link>
-        <h1 className="rp-title">
-          <span className="rp-num">#{number}</span> · Spatial review
-        </h1>
-        <p className="rp-sub">
-          Files in the order a reviewer would naturally read them, laid out
-          spatially by import dependency. Click a file to focus.
-        </p>
+        {/* Title row — uses PR title if available, otherwise just the number. */}
+        <div className="pr-title-row">
+          <span className="rp-num">#{number}</span>
+          <h1 className="pr-headline">
+            {meta.data?.pr.title ?? "Spatial review"}
+          </h1>
+          {meta.data?.pr.draft && <span className="rp-tag draft-pr">draft</span>}
+          {meta.data?.pr.htmlUrl && (
+            <a
+              className="pr-external"
+              href={meta.data.pr.htmlUrl}
+              target="_blank"
+              rel="noreferrer"
+              title="Open on GitHub"
+            >
+              ↗ github
+            </a>
+          )}
+        </div>
+        {meta.data && (
+          <div className="pr-byline">
+            <span>
+              by <strong>@{meta.data.pr.author}</strong>
+            </span>
+            <span className="dot">·</span>
+            <span>opened {relativeDate(meta.data.pr.createdAt)}</span>
+            <span className="dot">·</span>
+            <span>
+              <code>{meta.data.pr.baseRef}</code> ←{" "}
+              <code>{meta.data.pr.headRef}</code>
+            </span>
+            <span className="dot">·</span>
+            <span>{meta.data.commits.length} commit{meta.data.commits.length === 1 ? "" : "s"}</span>
+            <span className="dot">·</span>
+            <span>
+              <span className="fc-add">+{meta.data.pr.additions}</span>{" "}
+              <span className="fc-rm">−{meta.data.pr.deletions}</span> across{" "}
+              {meta.data.pr.changedFiles} file{meta.data.pr.changedFiles === 1 ? "" : "s"}
+            </span>
+          </div>
+        )}
+        {/* Author's description — collapsed by default if non-empty; the
+            reviewer expands when they want context. Open by default when the
+            description is short. */}
+        {meta.data?.pr.body && (
+          <details
+            className="pr-description"
+            open={contextOpen || meta.data.pr.body.length < 280}
+            onToggle={(e) =>
+              setContextOpen((e.target as HTMLDetailsElement).open)
+            }
+          >
+            <summary>
+              <span className="pr-block-label">Description</span>
+              <span className="pr-block-hint">
+                {meta.data.pr.body.length} chars
+              </span>
+            </summary>
+            <pre className="pr-description-body">{meta.data.pr.body}</pre>
+          </details>
+        )}
+        {meta.data && meta.data.commits.length > 0 && (
+          <details
+            className="pr-commits"
+            open={commitsOpen}
+            onToggle={(e) =>
+              setCommitsOpen((e.target as HTMLDetailsElement).open)
+            }
+          >
+            <summary>
+              <span className="pr-block-label">Commits</span>
+              <span className="pr-block-hint">
+                {meta.data.commits.length}
+              </span>
+            </summary>
+            <ol className="pr-commit-list">
+              {meta.data.commits.map((c) => {
+                const [subject, ...rest] = c.message.split("\n");
+                const bodyText = rest.join("\n").trim();
+                return (
+                  <li key={c.sha} className="pr-commit">
+                    <code className="pr-commit-sha">{c.sha.slice(0, 7)}</code>
+                    <div className="pr-commit-body">
+                      <div className="pr-commit-subject">{subject}</div>
+                      {bodyText && (
+                        <pre className="pr-commit-msg-body">{bodyText}</pre>
+                      )}
+                      <div className="pr-commit-meta">
+                        {c.author} · {relativeDate(c.date)}
+                      </div>
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+          </details>
+        )}
+        {meta.error && (
+          <div className="pr-meta-error">
+            Couldn&rsquo;t load PR description / commits:{" "}
+            <code>{meta.error}</code>
+          </div>
+        )}
       </header>
 
       {state.loading && <p className="dash-status">Computing reading path…</p>}
@@ -353,4 +497,30 @@ function FocusDetail({
 
 function basename(p: string): string {
   return p.split("/").slice(-1)[0] ?? p;
+}
+
+async function asJsonResponse(
+  r: Response,
+): Promise<{ ok: boolean; body: unknown }> {
+  try {
+    const body = await r.json();
+    return { ok: r.ok, body };
+  } catch {
+    return { ok: false, body: { error: `HTTP ${r.status}` } };
+  }
+}
+
+function relativeDate(iso: string): string {
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return iso;
+  const min = Math.floor((Date.now() - ts) / 60_000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  const mo = Math.floor(day / 30);
+  if (mo < 12) return `${mo}mo ago`;
+  return `${Math.floor(day / 365)}y ago`;
 }

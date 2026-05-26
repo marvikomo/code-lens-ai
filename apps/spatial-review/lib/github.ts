@@ -85,6 +85,121 @@ export interface PrFile {
   patch?: string;
 }
 
+export interface PrMeta {
+  number: number;
+  title: string;
+  /** Markdown body. Null for empty descriptions. */
+  body: string | null;
+  state: "open" | "closed";
+  draft: boolean;
+  author: string;
+  authorAvatarUrl: string | null;
+  createdAt: string;
+  updatedAt: string;
+  htmlUrl: string;
+  headSha: string;
+  baseSha: string;
+  baseRef: string;
+  headRef: string;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+}
+
+export interface PrCommit {
+  sha: string;
+  /** Full commit message (first line is the subject; rest is the body). */
+  message: string;
+  author: string;
+  authorEmail: string;
+  date: string;
+}
+
+/** Fetches the full PR object — title, description body, author, SHAs, stats. */
+export async function getPr(
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PrMeta> {
+  const res = await fetch(
+    `${GITHUB_API}/repos/${owner}/${repo}/pulls/${number}`,
+    { headers: authHeaders(), cache: "no-store" },
+  );
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `GitHub /pulls/${number} failed: ${res.status} — ${body.slice(0, 200)}`,
+    );
+  }
+  const raw = (await res.json()) as Record<string, unknown>;
+  const user = raw.user as { login: string; avatar_url: string } | undefined;
+  const head = raw.head as { sha: string; ref: string } | undefined;
+  const base = raw.base as { sha: string; ref: string } | undefined;
+  return {
+    number: Number(raw.number),
+    title: String(raw.title ?? ""),
+    body: (raw.body as string | null) ?? null,
+    state: (raw.state as "open" | "closed") ?? "open",
+    draft: Boolean(raw.draft),
+    author: user?.login ?? "",
+    authorAvatarUrl: user?.avatar_url ?? null,
+    createdAt: String(raw.created_at ?? ""),
+    updatedAt: String(raw.updated_at ?? ""),
+    htmlUrl: String(raw.html_url ?? ""),
+    headSha: head?.sha ?? "",
+    baseSha: base?.sha ?? "",
+    baseRef: base?.ref ?? "",
+    headRef: head?.ref ?? "",
+    additions: Number(raw.additions ?? 0),
+    deletions: Number(raw.deletions ?? 0),
+    changedFiles: Number(raw.changed_files ?? 0),
+  };
+}
+
+/** Lists commits included in a PR. */
+export async function listPrCommits(
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PrCommit[]> {
+  // Paginated like /files; same approach. Commits in a PR are usually small.
+  const all: PrCommit[] = [];
+  let url:
+    | string
+    | null = `${GITHUB_API}/repos/${owner}/${repo}/pulls/${number}/commits?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, {
+      headers: authHeaders(),
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(
+        `GitHub /pulls/${number}/commits failed: ${res.status} — ${body.slice(0, 200)}`,
+      );
+    }
+    const raw = (await res.json()) as Array<Record<string, unknown>>;
+    for (const c of raw) {
+      const inner = c.commit as
+        | {
+            message?: string;
+            author?: { name?: string; email?: string; date?: string };
+          }
+        | undefined;
+      all.push({
+        sha: String(c.sha),
+        message: inner?.message ?? "",
+        author: inner?.author?.name ?? "",
+        authorEmail: inner?.author?.email ?? "",
+        date: inner?.author?.date ?? "",
+      });
+    }
+    url = parseNextLink(res.headers.get("link"));
+    if (all.length >= 250) break; // safety cap
+  }
+  return all;
+}
+
 /**
  * Fetches the raw content of a file at a specific commit. Uses the contents
  * API which returns base64 + metadata (avoids relying on api.github.com's
