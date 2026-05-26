@@ -22,6 +22,15 @@
  *      with a flag so the UI can surface them distinctly.
  */
 import type { PrFileNode, PrSubgraph } from "./neo4j";
+import type { DiffLine } from "./diff";
+
+/** Per-filename PR metadata joined into reading-path entries. */
+export interface PrFileMeta {
+  additions: number;
+  deletions: number;
+  status: "added" | "modified" | "removed" | "renamed" | "copied" | "changed";
+  diff: DiffLine[];
+}
 
 export interface ReadingPathEntry {
   matchedPath: string;
@@ -35,22 +44,39 @@ export interface ReadingPathEntry {
   /** Resolved label fallback chain: label > heuristicLabel > community-N > null */
   communityLabel: string | null;
   communityId: number | null;
+  /** BFS depth from entry frontier. 0 = entry point. Used by canvas
+   *  to lay nodes out in columns. */
+  level: number;
+  /** Per-file PR stats (joined from the GitHub PR file list). */
+  additions: number;
+  deletions: number;
+  status: "added" | "modified" | "removed" | "renamed" | "copied" | "changed";
+  /** Parsed unified-diff lines. Empty if no patch was available
+   *  (binary file, too large, GitHub-truncated). */
+  diff: import("./diff").DiffLine[];
 }
 
 export interface ReadingPath {
   entries: ReadingPathEntry[];
   /** PR files not found in Neo4j (e.g., newly added, not yet indexed). */
   unmatched: string[];
+  /** IMPORTS edges within the PR subgraph. Endpoints are matchedPaths. */
+  edges: Array<{ from: string; to: string }>;
   /** Computation metadata for debugging / display. */
   meta: {
     matchedCount: number;
     unmatchedCount: number;
     edgeCount: number;
     entryCount: number;
+    /** Max BFS depth — number of layout columns the canvas will need. */
+    maxLevel: number;
   };
 }
 
-export function computeReadingPath(subgraph: PrSubgraph): ReadingPath {
+export function computeReadingPath(
+  subgraph: PrSubgraph,
+  fileMeta: Map<string, PrFileMeta>,
+): ReadingPath {
   const { nodes, edges, unmatched } = subgraph;
 
   // matchedPath → in-degree within the PR subgraph
@@ -82,10 +108,13 @@ export function computeReadingPath(subgraph: PrSubgraph): ReadingPath {
 
   const entryPathSet = new Set(frontier.map((n) => n.matchedPath));
 
-  // BFS, level by level, with within-level sorting.
+  // BFS, level by level, with within-level sorting. We tag each visited
+  // node with its level for downstream canvas layout (column = level).
   const visited = new Set<string>();
+  const levelOf = new Map<string, number>();
   const ordered: PrFileNode[] = [];
   let currentLevel: PrFileNode[] = frontier;
+  let depth = 0;
 
   while (currentLevel.length > 0) {
     currentLevel.sort(sortKey);
@@ -93,6 +122,7 @@ export function computeReadingPath(subgraph: PrSubgraph): ReadingPath {
     for (const n of currentLevel) {
       if (visited.has(n.matchedPath)) continue;
       visited.add(n.matchedPath);
+      levelOf.set(n.matchedPath, depth);
       ordered.push(n);
       const outs = outEdges.get(n.matchedPath);
       if (!outs) continue;
@@ -103,36 +133,52 @@ export function computeReadingPath(subgraph: PrSubgraph): ReadingPath {
       }
     }
     currentLevel = nextLevel;
+    depth++;
   }
 
-  // Catch any nodes the BFS didn't reach (e.g., disconnected component with
-  // all nodes having in-degree > 0 — shouldn't happen given the fallback,
-  // but defensive). Append at the end, sorted.
+  // Catch any nodes the BFS didn't reach (defensive). Append at the end,
+  // assigned to the next level so they don't visually overlap the BFS output.
   for (const n of nodes) {
     if (visited.has(n.matchedPath)) continue;
+    levelOf.set(n.matchedPath, depth);
     ordered.push(n);
   }
 
-  const entries: ReadingPathEntry[] = ordered.map((n) => ({
-    matchedPath: n.matchedPath,
-    absolutePath: n.absolutePath,
-    blastScore: n.blastScore,
-    blastDirect: n.blastDirect,
-    blastTransitive: n.blastTransitive,
-    isSpine: n.isSpine,
-    isEntry: entryPathSet.has(n.matchedPath),
-    communityLabel: resolveCommunityLabel(n),
-    communityId: n.communityId,
-  }));
+  const maxLevel = Math.max(0, ...Array.from(levelOf.values()));
+
+  const entries: ReadingPathEntry[] = ordered.map((n) => {
+    const meta = fileMeta.get(n.matchedPath);
+    return {
+      matchedPath: n.matchedPath,
+      absolutePath: n.absolutePath,
+      blastScore: n.blastScore,
+      blastDirect: n.blastDirect,
+      blastTransitive: n.blastTransitive,
+      isSpine: n.isSpine,
+      isEntry: entryPathSet.has(n.matchedPath),
+      communityLabel: resolveCommunityLabel(n),
+      communityId: n.communityId,
+      level: levelOf.get(n.matchedPath) ?? 0,
+      // Defaults cover the rare case where the BFS surfaces a node whose
+      // filename isn't in fileMeta (shouldn't happen since both derive
+      // from the PR file list, but defensive).
+      additions: meta?.additions ?? 0,
+      deletions: meta?.deletions ?? 0,
+      status: meta?.status ?? "modified",
+      diff: meta?.diff ?? [],
+    };
+  });
 
   return {
     entries,
     unmatched,
+    edges,
     meta: {
       matchedCount: nodes.length,
       unmatchedCount: unmatched.length,
       edgeCount: edges.length,
       entryCount: entryPathSet.size,
+      maxLevel,
     },
   };
 }

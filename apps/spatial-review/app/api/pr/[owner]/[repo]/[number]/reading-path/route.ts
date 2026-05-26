@@ -1,7 +1,8 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { listPrFiles } from "@/lib/github";
 import { getPrSubgraph } from "@/lib/neo4j";
-import { computeReadingPath } from "@/lib/reading-path";
+import { computeReadingPath, type PrFileMeta } from "@/lib/reading-path";
+import { parsePatch } from "@/lib/diff";
 
 interface Params {
   params: Promise<{ owner: string; repo: string; number: string }>;
@@ -22,15 +23,33 @@ export async function GET(_req: NextRequest, { params }: Params) {
     //    nothing to spatially review on a deleted file (it might still appear
     //    as a caller in Neo4j but that's a different concern).
     const prFiles = await listPrFiles(owner, repo, number);
-    const filenames = prFiles
-      .filter((f) => f.status !== "removed")
-      .map((f) => f.filename);
+    const relevant = prFiles.filter((f) => f.status !== "removed");
+    const filenames = relevant.map((f) => f.filename);
+
+    // Build the per-filename metadata map: PR stats + parsed diff hunks.
+    // computeReadingPath joins this onto each entry.
+    const fileMeta = new Map<string, PrFileMeta>();
+    for (const f of relevant) {
+      fileMeta.set(f.filename, {
+        additions: f.additions,
+        deletions: f.deletions,
+        status: f.status,
+        diff: parsePatch(f.patch),
+      });
+    }
 
     if (filenames.length === 0) {
       return NextResponse.json({
         entries: [],
         unmatched: [],
-        meta: { matchedCount: 0, unmatchedCount: 0, edgeCount: 0, entryCount: 0 },
+        edges: [],
+        meta: {
+          matchedCount: 0,
+          unmatchedCount: 0,
+          edgeCount: 0,
+          entryCount: 0,
+          maxLevel: 0,
+        },
         prFileCount: prFiles.length,
       });
     }
@@ -38,8 +57,8 @@ export async function GET(_req: NextRequest, { params }: Params) {
     // 2. Resolve file nodes + IMPORTS edges in Neo4j.
     const subgraph = await getPrSubgraph(filenames);
 
-    // 3. Run BFS to produce the deterministic reading path.
-    const path = computeReadingPath(subgraph);
+    // 3. Run BFS, joining in the PR file metadata per entry.
+    const path = computeReadingPath(subgraph, fileMeta);
 
     return NextResponse.json({
       ...path,

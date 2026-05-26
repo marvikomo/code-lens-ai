@@ -80,6 +80,9 @@ export interface PrFile {
   changes: number;
   /** Set on renames; the old path. */
   previousFilename?: string;
+  /** Unified-diff patch. Absent for binary files and files larger than
+   *  GitHub's truncation threshold (~150KB). We render whatever is here. */
+  patch?: string;
 }
 
 /** Lists files changed in a PR (no diff content; just metadata). */
@@ -118,6 +121,7 @@ export async function listPrFiles(
           typeof f.previous_filename === "string"
             ? f.previous_filename
             : undefined,
+        patch: typeof f.patch === "string" ? f.patch : undefined,
       });
     }
     // Follow GitHub's Link: <...>; rel="next" pagination.

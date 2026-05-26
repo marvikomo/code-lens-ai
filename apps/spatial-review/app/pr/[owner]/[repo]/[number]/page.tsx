@@ -1,4 +1,4 @@
-import { PrReadingPath } from "@/components/PrReadingPath";
+import { PrReview } from "@/components/PrReview";
 
 interface Params {
   params: Promise<{ owner: string; repo: string; number: string }>;
@@ -14,5 +14,5 @@ export default async function PrPage({ params }: Params) {
       </div>
     );
   }
-  return <PrReadingPath owner={owner} repo={repo} number={number} />;
+  return <PrReview owner={owner} repo={repo} number={number} />;
 }
