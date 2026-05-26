@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import type { ReadingPath, ReadingPathEntry } from "@/lib/reading-path";
 import type { PrMeta, PrCommit } from "@/lib/github";
+import { useReviewProgress } from "@/lib/use-review-progress";
 import { PrCanvas } from "./PrCanvas";
 import { ReaderPane } from "./ReaderPane";
 
@@ -48,6 +49,11 @@ export function PrReview({
   const [commitsOpen, setCommitsOpen] = useState(false);
   const [focusedPath, setFocusedPath] = useState<string | null>(null);
   const [readerOpen, setReaderOpen] = useState(false);
+  const { reviewed, toggle: toggleReviewed, isReviewed } = useReviewProgress(
+    owner,
+    repo,
+    number,
+  );
 
   // Open the reader on any click — sidebar row or canvas node. Esc / X
   // closes; focusedPath persists so the right pane still shows context
@@ -259,6 +265,29 @@ export function PrReview({
       {state.data && (
         <>
           <div className="review-meta">
+            {(() => {
+              const total = state.data.entries.length;
+              const done = state.data.entries.filter((e) =>
+                isReviewed(e.matchedPath),
+              ).length;
+              const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+              return (
+                <>
+                  <span
+                    className="review-progress"
+                    data-complete={done === total && total > 0 || undefined}
+                    title={`${done} of ${total} files reviewed (${pct}%)`}
+                  >
+                    <span
+                      className="review-progress-bar"
+                      style={{ width: `${pct}%` }}
+                    />
+                    <strong>{done} / {total}</strong> reviewed
+                  </span>
+                  <span className="dot">·</span>
+                </>
+              );
+            })()}
             <span>
               <strong>{state.data.meta.matchedCount}</strong> in graph
             </span>
@@ -303,7 +332,9 @@ export function PrReview({
                       entry={e}
                       index={i}
                       active={focusedPath === e.matchedPath}
+                      reviewed={isReviewed(e.matchedPath)}
                       onClick={() => setFocusedPath(e.matchedPath)}
+                      onToggleReviewed={() => toggleReviewed(e.matchedPath)}
                     />
                   ))}
                 </ol>
@@ -370,12 +401,16 @@ function ReadingPathRow({
   entry,
   index,
   active,
+  reviewed,
   onClick,
+  onToggleReviewed,
 }: {
   entry: ReadingPathEntry;
   index: number;
   active: boolean;
+  reviewed: boolean;
   onClick: () => void;
+  onToggleReviewed: () => void;
 }) {
   // Auto-scroll into view when activated by an external click (canvas).
   const ref = useRef<HTMLLIElement>(null);
@@ -388,9 +423,20 @@ function ReadingPathRow({
   return (
     <li
       ref={ref}
-      className={`rp-row ${active ? "active" : ""}`}
+      className={`rp-row ${active ? "active" : ""} ${reviewed ? "reviewed" : ""}`}
       onClick={onClick}
     >
+      <input
+        type="checkbox"
+        className="rp-check"
+        checked={reviewed}
+        onChange={onToggleReviewed}
+        // Stop the click from bubbling — checkbox toggles should not also
+        // focus the row (which would open the reader if launched from canvas).
+        onClick={(e) => e.stopPropagation()}
+        aria-label={`Mark ${basename(entry.matchedPath)} as reviewed`}
+        title={reviewed ? "Mark as not reviewed" : "Mark as reviewed"}
+      />
       <span className="rp-index">{index + 1}</span>
       <span className="rp-body">
         <span className="rp-path">

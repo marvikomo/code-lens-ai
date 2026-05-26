@@ -1294,6 +1294,81 @@ body > div {
   margin-top: 2px;
 }
 
+/* "Reviewed" checkbox + row state */
+.rp-check {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: #16a34a;
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 3px;
+}
+
+.rp-row.reviewed .rp-index {
+  background: #dcfce7;
+  color: #16a34a;
+}
+
+.rp-row.reviewed .rp-path {
+  color: #94a3b8;
+  text-decoration: line-through;
+  text-decoration-color: rgba(148, 163, 184, 0.5);
+}
+
+.rp-row.reviewed .rp-line3 {
+  opacity: 0.6;
+}
+
+.rp-row.reviewed.active {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+}
+
+/* Progress indicator in the meta strip */
+.review-progress {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #ffffff;
+  font-size: 11px;
+  color: #334155;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.review-progress strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #0f172a;
+}
+
+.review-progress[data-complete] {
+  background: #dcfce7;
+  border-color: #86efac;
+  color: #15803d;
+}
+
+.review-progress[data-complete] strong {
+  color: #14532d;
+}
+
+.review-progress-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(59, 130, 246, 0.12);
+  z-index: -1;
+  transition: width 0.2s ease-out;
+}
+
+.review-progress[data-complete] .review-progress-bar {
+  background: rgba(34, 197, 94, 0.18);
+}
+
 .rp-unmatched.compact {
   margin-top: 14px;
   padding: 8px 10px;
@@ -1702,6 +1777,22 @@ body > div {
   min-height: 0;
 }
 
+.reader-diff-pane {
+  position: relative;
+  min-height: 0;
+  background: #fafbfc;
+  overflow: hidden;
+}
+
+.reader-diff-scroll {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 16px 32px 16px 20px; /* right padding clears the minimap */
+}
+
+/* Legacy class kept for the no-diff / loading states that don't need the
+   relative-pane wrapper. */
 .reader-diff-wrap {
   overflow-y: auto;
   min-height: 0;
@@ -1810,6 +1901,54 @@ body > div {
   text-align: center;
   color: #94a3b8;
   font-size: 13px;
+}
+
+/* ---------- Reader minimap ---------- */
+/* Absolute child of .reader-diff-pane — pinned to the right edge of the
+   visible viewport, independent of the diff's scroll position. */
+.reader-minimap {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 14px;
+  background: #f1f5f9;
+  border-left: 1px solid #e2e8f0;
+  cursor: pointer;
+  z-index: 2;
+}
+
+.mm-mark {
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  height: 3px;
+  border-radius: 1px;
+  pointer-events: none;
+}
+
+.mm-added {
+  background: #16a34a;
+}
+
+.mm-removed-ghost {
+  background: #dc2626;
+}
+
+.mm-viewport {
+  position: absolute;
+  left: 0;
+  right: 0;
+  background: rgba(15, 23, 42, 0.12);
+  border-top: 1px solid rgba(15, 23, 42, 0.25);
+  border-bottom: 1px solid rgba(15, 23, 42, 0.25);
+  pointer-events: none;
+  transition: top 0.04s linear, height 0.04s linear;
+}
+
+.reader-minimap:hover .mm-viewport {
+  background: rgba(59, 130, 246, 0.18);
+  border-color: rgba(59, 130, 246, 0.4);
 }
 
 .reader-diff.full-file {

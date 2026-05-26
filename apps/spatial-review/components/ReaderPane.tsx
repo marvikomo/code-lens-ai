@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReadingPathEntry } from "@/lib/reading-path";
 import type { FileViewLine } from "@/lib/file-view";
+import { ReaderMinimap } from "./ReaderMinimap";
 
 interface ReaderPaneProps {
   owner: string;
@@ -174,39 +175,47 @@ export function ReaderPane({
         </header>
 
         <div className="reader-body">
-          <main className="reader-diff-wrap" ref={diffWrapRef}>
-            {fileState.kind === "loading" && (
-              <div className="reader-loading">Loading file at HEAD…</div>
-            )}
-            {fileState.kind === "error" && (
-              <div className="reader-no-diff">
-                Couldn&rsquo;t load full file: <code>{fileState.message}</code>
-              </div>
-            )}
+          <main className="reader-diff-pane">
+            <div className="reader-diff-scroll" ref={diffWrapRef}>
+              {fileState.kind === "loading" && (
+                <div className="reader-loading">Loading file at HEAD…</div>
+              )}
+              {fileState.kind === "error" && (
+                <div className="reader-no-diff">
+                  Couldn&rsquo;t load full file: <code>{fileState.message}</code>
+                </div>
+              )}
+              {fileState.kind === "ready" && (
+                <pre className="reader-diff full-file">
+                  {fileState.data.view.map((line, i) => (
+                    <div
+                      key={i}
+                      ref={i === firstChangeIdx ? firstChangeRef : undefined}
+                      className={`reader-line reader-line-${line.kind}`}
+                    >
+                      <span className="reader-lineno">
+                        {line.kind === "removed-ghost"
+                          ? line.baseLine ?? ""
+                          : line.headLine ?? ""}
+                      </span>
+                      <span className="reader-gutter">
+                        {line.kind === "added"
+                          ? "+"
+                          : line.kind === "removed-ghost"
+                            ? "−"
+                            : " "}
+                      </span>
+                      <code>{line.text || " "}</code>
+                    </div>
+                  ))}
+                </pre>
+              )}
+            </div>
             {fileState.kind === "ready" && (
-              <pre className="reader-diff full-file">
-                {fileState.data.view.map((line, i) => (
-                  <div
-                    key={i}
-                    ref={i === firstChangeIdx ? firstChangeRef : undefined}
-                    className={`reader-line reader-line-${line.kind}`}
-                  >
-                    <span className="reader-lineno">
-                      {line.kind === "removed-ghost"
-                        ? line.baseLine ?? ""
-                        : line.headLine ?? ""}
-                    </span>
-                    <span className="reader-gutter">
-                      {line.kind === "added"
-                        ? "+"
-                        : line.kind === "removed-ghost"
-                          ? "−"
-                          : " "}
-                    </span>
-                    <code>{line.text || " "}</code>
-                  </div>
-                ))}
-              </pre>
+              <ReaderMinimap
+                view={fileState.data.view}
+                scrollContainerRef={diffWrapRef}
+              />
             )}
           </main>
 
