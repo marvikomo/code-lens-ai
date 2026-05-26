@@ -71,6 +71,72 @@ export async function listMyRepos(): Promise<GitHubRepo[]> {
   return raw.map(mapRepo);
 }
 
+export interface PrFile {
+  /** Repo-relative path (forward slashes, no leading slash). */
+  filename: string;
+  status: "added" | "modified" | "removed" | "renamed" | "copied" | "changed";
+  additions: number;
+  deletions: number;
+  changes: number;
+  /** Set on renames; the old path. */
+  previousFilename?: string;
+}
+
+/** Lists files changed in a PR (no diff content; just metadata). */
+export async function listPrFiles(
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PrFile[]> {
+  // GitHub paginates this at 30/page by default; we bump to 100 and follow
+  // pagination via the Link header. For most PRs even 100 is enough; very
+  // large PRs (>100 files changed) we paginate.
+  const all: PrFile[] = [];
+  let url:
+    | string
+    | null = `${GITHUB_API}/repos/${owner}/${repo}/pulls/${number}/files?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, {
+      headers: authHeaders(),
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(
+        `GitHub /pulls/${number}/files failed: ${res.status} — ${body.slice(0, 200)}`,
+      );
+    }
+    const raw = (await res.json()) as Array<Record<string, unknown>>;
+    for (const f of raw) {
+      all.push({
+        filename: String(f.filename),
+        status: String(f.status) as PrFile["status"],
+        additions: Number(f.additions ?? 0),
+        deletions: Number(f.deletions ?? 0),
+        changes: Number(f.changes ?? 0),
+        previousFilename:
+          typeof f.previous_filename === "string"
+            ? f.previous_filename
+            : undefined,
+      });
+    }
+    // Follow GitHub's Link: <...>; rel="next" pagination.
+    url = parseNextLink(res.headers.get("link"));
+    if (all.length >= 500) break; // safety cap — no real PR is bigger
+  }
+  return all;
+}
+
+function parseNextLink(linkHeader: string | null): string | null {
+  if (!linkHeader) return null;
+  // Format: <url1>; rel="next", <url2>; rel="prev"
+  for (const part of linkHeader.split(",")) {
+    const m = part.trim().match(/^<([^>]+)>;\s*rel="next"$/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
 /** Lists open PRs for a repo. */
 export async function listOpenPrs(
   owner: string,
