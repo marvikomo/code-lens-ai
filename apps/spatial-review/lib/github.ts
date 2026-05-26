@@ -85,6 +85,38 @@ export interface PrFile {
   patch?: string;
 }
 
+/**
+ * Fetches the raw content of a file at a specific commit. Uses the contents
+ * API which returns base64 + metadata (avoids relying on api.github.com's
+ * 1MB single-call limit by using the `raw` media type when possible).
+ *
+ * For files larger than 1MB, GitHub returns base64=null and we must fall
+ * back to the blob endpoint. Most PR'd files are well under that.
+ */
+export async function getFileContent(
+  owner: string,
+  repo: string,
+  sha: string,
+  path: string,
+): Promise<string> {
+  const url = `${GITHUB_API}/repos/${owner}/${repo}/contents/${encodeURI(path)}?ref=${sha}`;
+  const res = await fetch(url, {
+    headers: {
+      ...authHeaders(),
+      // raw media type → returns the file bytes directly, no base64 envelope
+      Accept: "application/vnd.github.raw",
+    },
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `GitHub /contents/${path}@${sha.slice(0, 7)} failed: ${res.status} — ${body.slice(0, 200)}`,
+    );
+  }
+  return await res.text();
+}
+
 /** Lists files changed in a PR (no diff content; just metadata). */
 export async function listPrFiles(
   owner: string,

@@ -206,6 +206,9 @@ export function PrReview({
           )}
           {readerOpen && focused && state.data && (
             <ReaderPane
+              owner={owner}
+              repo={repo}
+              number={number}
               entries={state.data.entries}
               edges={state.data.edges}
               focusedPath={focused.matchedPath}

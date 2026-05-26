@@ -1,9 +1,13 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReadingPathEntry } from "@/lib/reading-path";
+import type { FileViewLine } from "@/lib/file-view";
 
 interface ReaderPaneProps {
+  owner: string;
+  repo: string;
+  number: number;
   entries: ReadingPathEntry[];
   edges: Array<{ from: string; to: string }>;
   /** Currently focused path. Must match one of entries[].matchedPath. */
@@ -12,7 +16,25 @@ interface ReaderPaneProps {
   onNavigate: (matchedPath: string) => void;
 }
 
+interface FileViewResponse {
+  path: string;
+  status: ReadingPathEntry["status"];
+  headSha: string;
+  view: FileViewLine[];
+  changeLineIndices: number[];
+  stats: { additions: number; deletions: number };
+  error?: string;
+}
+
+type FileState =
+  | { kind: "loading" }
+  | { kind: "ready"; data: FileViewResponse }
+  | { kind: "error"; message: string };
+
 export function ReaderPane({
+  owner,
+  repo,
+  number,
   entries,
   edges,
   focusedPath,
@@ -33,12 +55,55 @@ export function ReaderPane({
     [edges, focusedPath],
   );
 
-  // Keyboard: Esc closes, ←/→ or j/k navigate. Mounted on window so the
-  // shortcuts work even if focus isn't on the pane itself.
+  // Fetch full-file view from the backend whenever focused file changes.
+  const [fileState, setFileState] = useState<FileState>({ kind: "loading" });
+  const diffWrapRef = useRef<HTMLDivElement>(null);
+  const firstChangeRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFileState({ kind: "loading" });
+    (async () => {
+      try {
+        const res = await fetch(
+          `/api/pr/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/file?path=${encodeURIComponent(focusedPath)}`,
+        );
+        const body = (await res.json()) as FileViewResponse;
+        if (cancelled) return;
+        if (!res.ok || body.error) {
+          setFileState({
+            kind: "error",
+            message: body.error ?? `HTTP ${res.status}`,
+          });
+        } else {
+          setFileState({ kind: "ready", data: body });
+        }
+      } catch (err) {
+        if (cancelled) return;
+        setFileState({
+          kind: "error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [owner, repo, number, focusedPath]);
+
+  // Auto-scroll to first change after content loads.
+  useEffect(() => {
+    if (fileState.kind === "ready" && firstChangeRef.current) {
+      firstChangeRef.current.scrollIntoView({
+        block: "center",
+        behavior: "auto",
+      });
+    }
+  }, [fileState]);
+
+  // Keyboard: Esc closes, ←/→ or j/k navigate.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // Ignore when typing in an input/textarea (defensive — none in this
-      // pane currently, but reviewer-notes textarea may land later).
       const target = e.target as HTMLElement | null;
       if (
         target?.tagName === "INPUT" ||
@@ -67,6 +132,12 @@ export function ReaderPane({
   const basename =
     entry.matchedPath.split("/").slice(-1)[0] ?? entry.matchedPath;
 
+  // Compute the index of the first change line for auto-scroll attachment.
+  const firstChangeIdx =
+    fileState.kind === "ready" && fileState.data.changeLineIndices.length > 0
+      ? fileState.data.changeLineIndices[0]
+      : -1;
+
   return (
     <div className="reader-overlay" onClick={onClose} role="dialog">
       <div className="reader-pane" onClick={(e) => e.stopPropagation()}>
@@ -80,6 +151,12 @@ export function ReaderPane({
               <div className="reader-tags">
                 {entry.isEntry && <span className="rp-tag entry">entry</span>}
                 {entry.isSpine && <span className="rp-tag spine">spine</span>}
+                {entry.status === "added" && (
+                  <span className="rp-tag added-file">new file</span>
+                )}
+                {entry.status === "renamed" && (
+                  <span className="rp-tag renamed-file">renamed</span>
+                )}
               </div>
             </div>
             <div className="reader-path">
@@ -97,33 +174,39 @@ export function ReaderPane({
         </header>
 
         <div className="reader-body">
-          <main className="reader-diff-wrap">
-            {entry.diff.length > 0 ? (
-              <pre className="reader-diff">
-                {entry.diff.map((line, i) => (
+          <main className="reader-diff-wrap" ref={diffWrapRef}>
+            {fileState.kind === "loading" && (
+              <div className="reader-loading">Loading file at HEAD…</div>
+            )}
+            {fileState.kind === "error" && (
+              <div className="reader-no-diff">
+                Couldn&rsquo;t load full file: <code>{fileState.message}</code>
+              </div>
+            )}
+            {fileState.kind === "ready" && (
+              <pre className="reader-diff full-file">
+                {fileState.data.view.map((line, i) => (
                   <div
                     key={i}
+                    ref={i === firstChangeIdx ? firstChangeRef : undefined}
                     className={`reader-line reader-line-${line.kind}`}
                   >
+                    <span className="reader-lineno">
+                      {line.kind === "removed-ghost"
+                        ? line.baseLine ?? ""
+                        : line.headLine ?? ""}
+                    </span>
                     <span className="reader-gutter">
                       {line.kind === "added"
                         ? "+"
-                        : line.kind === "removed"
+                        : line.kind === "removed-ghost"
                           ? "−"
-                          : line.kind === "hunk-separator"
-                            ? "⋯"
-                            : " "}
+                          : " "}
                     </span>
                     <code>{line.text || " "}</code>
                   </div>
                 ))}
               </pre>
-            ) : (
-              <div className="reader-no-diff">
-                No diff available — file is binary, exceeds GitHub&rsquo;s
-                patch size limit, or has status:{" "}
-                <code>{entry.status}</code>.
-              </div>
             )}
           </main>
 

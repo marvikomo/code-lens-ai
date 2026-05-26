@@ -1744,7 +1744,30 @@ body > div {
 .reader-line-added .reader-gutter {
   color: #16a34a;
 }
+.reader-line-added .reader-lineno {
+  color: #16a34a;
+}
 
+/* removed-ghost = a line that WAS in the base file at this position
+   but isn't in HEAD. Rendered inline with red strikethrough, head
+   line number column shows "—" since the line has no current line. */
+.reader-line-removed-ghost {
+  background: #fee2e2;
+}
+.reader-line-removed-ghost .reader-gutter {
+  color: #dc2626;
+}
+.reader-line-removed-ghost .reader-lineno {
+  color: #dc2626;
+  font-style: italic;
+}
+.reader-line-removed-ghost code {
+  text-decoration: line-through;
+  text-decoration-color: rgba(220, 38, 38, 0.4);
+  color: #7f1d1d;
+}
+
+/* Legacy class for the patch-only view (still used if we fall back). */
 .reader-line-removed {
   background: #fee2e2;
 }
@@ -1768,6 +1791,40 @@ body > div {
 .reader-line-hunk-separator code {
   color: #94a3b8;
   font-style: italic;
+}
+
+/* Line number column — sits before the gutter sigil. Muted color, fixed
+   width, right-aligned so single-digit and four-digit line numbers
+   share the same right edge. */
+.reader-lineno {
+  width: 48px;
+  flex-shrink: 0;
+  text-align: right;
+  padding-right: 8px;
+  color: #cbd5e1;
+  user-select: none;
+}
+
+.reader-loading {
+  padding: 32px 16px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+.reader-diff.full-file {
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+/* New file / renamed badges on the reader header */
+.rp-tag.added-file {
+  background: #dcfce7;
+  color: #15803d;
+}
+.rp-tag.renamed-file {
+  background: #e0e7ff;
+  color: #3730a3;
 }
 
 .reader-no-diff {
