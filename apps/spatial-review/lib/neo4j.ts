@@ -83,6 +83,118 @@ export async function listIndexedRepos(): Promise<IndexedRepo[]> {
   }
 }
 
+export interface OutsideCaller {
+  /** The caller's containing file path (NOT in the PR). */
+  callerPath: string;
+  /** The caller symbol's name (function/method/class). */
+  callerName: string;
+  /** Confidence the analyzer assigned to this CALLS edge. */
+  confidence: string;
+}
+
+export interface ChangedFunctionCallers {
+  /** The changed function/method/class/variable's name. */
+  fnName: string;
+  /** Its signature, if known. */
+  fnSignature: string | null;
+  /** Kind (Function/Method/Class/Variable). */
+  fnKind: string;
+  /** Start row (0-indexed, like code-lens-aI stores). */
+  fnStartRow: number;
+  /** Distinct outside-PR callers, deduplicated by (path, name). */
+  callers: OutsideCaller[];
+}
+
+/**
+ * For one PR file: find each defined symbol whose source line range
+ * intersects a changed range in the diff, then list the callers of those
+ * symbols whose containing file is NOT in the PR.
+ *
+ * Why this matters for review:
+ *   blast=47 is abstract. "validateInput is called by api/users.ts and
+ *   middleware/auth.ts (neither in this PR) — if you change its contract,
+ *   those break" is actionable.
+ *
+ * Edge confidence carries through so the UI can show "3 high-confidence
+ * callers, 2 name-only matches."
+ */
+export async function getOutsidePrCallers(
+  absolutePath: string,
+  /** Changed line ranges in HEAD, 0-indexed inclusive [start, end]. */
+  changedRanges: Array<{ start: number; end: number }>,
+  /** All file paths in the PR (absolute). Callers IN these are filtered out. */
+  prAbsPaths: string[],
+): Promise<ChangedFunctionCallers[]> {
+  if (changedRanges.length === 0) return [];
+
+  const s = session();
+  try {
+    const res = await s.executeRead((tx) =>
+      tx.run(
+        // Walk 1-2 hops: File-[:DEFINES]->(fn) catches top-level Functions /
+        // Classes / Variables; File-[:DEFINES]->(:Class)-[:HAS_METHOD]->(m)
+        // catches class methods. Without the second hop we'd miss every
+        // method in OO TypeScript codebases — see broker.ts in the demo.
+        // We resolve the immediate symbol's "containing file" via a back-link,
+        // not just $path, so the path check is robust even with renames.
+        `MATCH (f:File {path: $path})-[:DEFINES|HAS_METHOD*1..2]->(fn)
+         WHERE (fn:Function OR fn:Method OR fn:Class OR fn:Variable)
+           AND fn.startRow IS NOT NULL
+           // Symbol's line range intersects any changed BASE range.
+           AND any(r IN $ranges WHERE
+                   r.start <= coalesce(fn.endRow, fn.startRow)
+                   AND r.end >= fn.startRow)
+         WITH DISTINCT fn
+         // Outbound to callers via CALLS. Caller's containing file is
+         // resolved through DEFINES (direct) OR HAS_METHOD<-DEFINES (methods).
+         OPTIONAL MATCH (caller)-[c:CALLS]->(fn)
+         WITH fn, caller, c
+         WHERE caller IS NOT NULL AND c IS NOT NULL
+         OPTIONAL MATCH (callerFile:File)-[:DEFINES|HAS_METHOD*1..2]->(caller)
+         WITH fn, caller, c, callerFile
+         WHERE callerFile IS NOT NULL
+           AND NOT callerFile.path IN $prAbsPaths
+         WITH fn,
+              collect(DISTINCT {
+                callerPath: callerFile.path,
+                callerName: coalesce(caller.name, '(anonymous)'),
+                confidence: coalesce(c.confidence, 'unknown')
+              }) AS callers
+         RETURN fn.name AS fnName,
+                fn.signature AS fnSignature,
+                head(labels(fn)) AS fnKind,
+                fn.startRow AS fnStartRow,
+                callers
+         ORDER BY fn.startRow ASC`,
+        {
+          path: absolutePath,
+          ranges: changedRanges,
+          prAbsPaths,
+        },
+      ),
+    );
+    const out: ChangedFunctionCallers[] = [];
+    for (const rec of res.records) {
+      const callers = rec.get("callers") as unknown;
+      if (!Array.isArray(callers)) continue;
+      out.push({
+        fnName: String(rec.get("fnName") ?? "(anonymous)"),
+        fnSignature: (rec.get("fnSignature") as string | null) ?? null,
+        fnKind: String(rec.get("fnKind") ?? "Symbol"),
+        fnStartRow: toInt(rec.get("fnStartRow")),
+        callers: (callers as Array<Record<string, unknown>>).map((c) => ({
+          callerPath: String(c.callerPath ?? ""),
+          callerName: String(c.callerName ?? ""),
+          confidence: String(c.confidence ?? "unknown"),
+        })),
+      });
+    }
+    return out;
+  } finally {
+    await s.close();
+  }
+}
+
 function toInt(v: unknown): number {
   if (v == null) return 0;
   if (typeof v === "number") return v;

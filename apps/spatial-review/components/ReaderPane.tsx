@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReadingPathEntry } from "@/lib/reading-path";
 import type { FileViewLine } from "@/lib/file-view";
+import type { ChangedFunctionCallers } from "@/lib/neo4j";
 import { ReaderMinimap } from "./ReaderMinimap";
 
 interface ReaderPaneProps {
@@ -24,6 +25,7 @@ interface FileViewResponse {
   view: FileViewLine[];
   changeLineIndices: number[];
   stats: { additions: number; deletions: number };
+  outsideCallers: ChangedFunctionCallers[];
   error?: string;
 }
 
@@ -284,6 +286,19 @@ export function ReaderPane({
                 )}
               </div>
             )}
+
+            {/* Outside-PR callers: the actionable answer to "what could
+                break if I change this." Listed per changed function so the
+                reviewer can drill down. */}
+            {fileState.kind === "ready" &&
+              fileState.data.outsideCallers.length > 0 && (
+                <div className="reader-meta-section">
+                  <label>Called by (outside this PR)</label>
+                  <OutsideCallersList
+                    items={fileState.data.outsideCallers}
+                  />
+                </div>
+              )}
           </aside>
         </div>
 
@@ -325,4 +340,51 @@ export function ReaderPane({
 
 function basenameOf(p: string): string {
   return p.split("/").slice(-1)[0] ?? p;
+}
+
+function OutsideCallersList({ items }: { items: ChangedFunctionCallers[] }) {
+  // Total callers across all changed symbols — for the header summary.
+  const totalCallers = items.reduce((n, x) => n + x.callers.length, 0);
+  return (
+    <div className="outside-callers">
+      <p className="reader-hint">
+        {items.length} changed symbol
+        {items.length === 1 ? "" : "s"} · {totalCallers} caller
+        {totalCallers === 1 ? "" : "s"} not in this PR. Changing the
+        contract here may break them.
+      </p>
+      {items.map((it) => (
+        <details key={`${it.fnName}@${it.fnStartRow}`} className="oc-fn">
+          <summary>
+            <code className="oc-fn-name">{it.fnName}</code>
+            <span className="oc-fn-kind">{it.fnKind.toLowerCase()}</span>
+            <span className="oc-count">
+              {it.callers.length} caller{it.callers.length === 1 ? "" : "s"}
+            </span>
+          </summary>
+          {it.callers.length === 0 ? (
+            <p className="reader-hint oc-empty">
+              No callers found outside the PR — change appears self-contained
+              within this PR&rsquo;s file set.
+            </p>
+          ) : (
+            <ul className="oc-caller-list">
+              {it.callers.map((c, i) => {
+                const confidenceClass = `oc-conf-${c.confidence.replace(/[^a-z]/gi, "")}`;
+                return (
+                  <li key={i} className={confidenceClass}>
+                    <span className="oc-conf-dot" title={`confidence: ${c.confidence}`} />
+                    <code className="oc-caller-name">{c.callerName}</code>
+                    <span className="oc-caller-path">
+                      {basenameOf(c.callerPath)}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </details>
+      ))}
+    </div>
+  );
 }

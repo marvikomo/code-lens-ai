@@ -2274,6 +2274,145 @@ body > div {
   text-decoration: underline;
 }
 
+/* ---------- Outside-PR callers section ---------- */
+.outside-callers {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.oc-fn {
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.oc-fn summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  cursor: pointer;
+  user-select: none;
+  background: #f8fafc;
+  list-style: none;
+  font-size: 11px;
+}
+
+.oc-fn summary::-webkit-details-marker {
+  display: none;
+}
+
+.oc-fn summary::before {
+  content: "▸";
+  color: #94a3b8;
+  font-size: 9px;
+  transition: transform 0.1s;
+}
+
+.oc-fn[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.oc-fn summary:hover {
+  background: #f1f5f9;
+}
+
+.oc-fn-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+  color: #0f172a;
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.oc-fn-kind {
+  font-size: 9px;
+  color: #94a3b8;
+  text-transform: lowercase;
+  font-style: italic;
+}
+
+.oc-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: #64748b;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  flex-shrink: 0;
+}
+
+.oc-empty {
+  margin: 6px 8px 8px;
+  font-size: 11px;
+}
+
+.oc-caller-list {
+  list-style: none;
+  padding: 4px 0;
+  margin: 0;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.oc-caller-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  border-top: 1px solid #f8fafc;
+}
+
+.oc-caller-list li:first-child {
+  border-top: none;
+}
+
+.oc-conf-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* Confidence colors — green for exact, amber for inferred/name-only,
+   gray for dynamic / unknown. Maps code-lens-aI's existing confidence
+   enum onto a 3-bucket trust scale. */
+.oc-conf-exact .oc-conf-dot {
+  background: #16a34a;
+}
+.oc-conf-ambiguous .oc-conf-dot,
+.oc-conf-inferred .oc-conf-dot {
+  background: #f59e0b;
+}
+.oc-conf-nameonly .oc-conf-dot {
+  background: #f59e0b;
+}
+.oc-conf-dynamic .oc-conf-dot,
+.oc-conf-unknown .oc-conf-dot {
+  background: #94a3b8;
+}
+
+.oc-caller-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #0f172a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+.oc-caller-path {
+  margin-left: auto;
+  font-size: 10px;
+  color: #94a3b8;
+  flex-shrink: 0;
+}
+
 .reader-foot {
   display: flex;
   align-items: center;
