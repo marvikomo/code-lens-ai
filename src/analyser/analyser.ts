@@ -8,10 +8,16 @@ import {
   EdgeSource,
 } from "../util/graph";
 import { detectLanguage, SupportedLanguage } from "../util/language";
-import { getParser } from "./../util/parserFactory";
+import {
+  getParser,
+  GrammarUnavailableError,
+  preloadGrammars,
+} from "./../util/parserFactory";
 import { ExtractContext, LanguageExtractor } from "../extractor/base";
 import { JsTsExtractor } from "../extractor/jsts";
 import { JavaExtractor } from "../extractor/java";
+import { GenericExtractor } from "../extractor/generic";
+import { LANGUAGE_CONFIGS } from "../extractor/configs";
 import { sha256OfFile } from "../util/hash";
 
 export interface AnalyzeOptions {
@@ -55,6 +61,27 @@ const DEFAULT_IGNORES = new Set([
   ".next",
   "coverage",
 ]);
+
+/**
+ * Load the grammars a repository actually needs, before the (synchronous)
+ * analysis walk starts.
+ *
+ * Two grammars are ESM-only, so they can only be loaded by an async dynamic
+ * import — hence a separate preload step rather than lazy loading inside the
+ * walk. Only the languages present in the tree are loaded, so indexing a pure
+ * TypeScript repo does not pay for twenty native addons.
+ */
+export async function preloadRepositoryGrammars(
+  repoPath: string,
+  opts: AnalyzeOptions = {},
+): Promise<{
+  loaded: SupportedLanguage[];
+  failed: { language: SupportedLanguage; reason: string }[];
+}> {
+  const scan = scanRepository(repoPath, { ignore: opts.ignore });
+  const languages = Array.from(new Set(scan.files.map((f) => f.language)));
+  return preloadGrammars(languages);
+}
 
 export function analyzeRepository(
   repoPath: string,
@@ -321,9 +348,24 @@ function analyzeFile(
     return;
   }
 
+  let parser;
+  try {
+    parser = getParser(language);
+  } catch (err) {
+    // A grammar that is missing, unbuilt, or ABI-incompatible costs us that
+    // language, not the run. Reported once per language.
+    if (err instanceof GrammarUnavailableError) {
+      warnLanguageOnce(
+        language,
+        `[codelens] skipping ${language} files: ${err.message}`,
+      );
+      return;
+    }
+    throw err;
+  }
+
   let tree;
   try {
-    const parser = getParser(language);
     // node-tree-sitter's default internal buffer is 32 KiB; pass an explicit
     // bufferSize so files larger than that still parse cleanly.
     tree = parser.parse(source, undefined, {
@@ -335,6 +377,13 @@ function analyzeFile(
   }
 
   const extractor = pickExtractor(language);
+  if (!extractor) {
+    warnLanguageOnce(
+      language,
+      `[codelens] no extractor registered for ${language}; files skipped`,
+    );
+    return;
+  }
   const ctx: ExtractContext = {
     builder,
     fileNode,
@@ -345,15 +394,49 @@ function analyzeFile(
   extractor.extract(tree.rootNode, ctx);
 }
 
-function pickExtractor(language: SupportedLanguage): LanguageExtractor {
+/**
+ * Bespoke extractors for the four languages that have one, the config-driven
+ * generic walker for everything else.
+ *
+ * Extractors are stateless, so instances are cached per language rather than
+ * rebuilt for every file.
+ */
+const extractorCache = new Map<SupportedLanguage, LanguageExtractor>();
+
+function pickExtractor(language: SupportedLanguage): LanguageExtractor | null {
+  const cached = extractorCache.get(language);
+  if (cached) return cached;
+
+  let extractor: LanguageExtractor | null = null;
   switch (language) {
     case "java":
-      return new JavaExtractor();
+      extractor = new JavaExtractor();
+      break;
     case "javascript":
     case "typescript":
     case "tsx":
-      return new JsTsExtractor();
+      extractor = new JsTsExtractor();
+      break;
+    default: {
+      const config = LANGUAGE_CONFIGS[language];
+      extractor = config ? new GenericExtractor(config) : null;
+    }
   }
+
+  if (extractor) extractorCache.set(language, extractor);
+  return extractor;
+}
+
+/**
+ * Languages already reported as unparseable, so a repo with 400 .rs files and
+ * no rust grammar produces one warning rather than 400.
+ */
+const warnedLanguages = new Set<SupportedLanguage>();
+
+function warnLanguageOnce(language: SupportedLanguage, message: string): void {
+  if (warnedLanguages.has(language)) return;
+  warnedLanguages.add(language);
+  console.warn(message);
 }
 
 const JS_EXT_PRIORITY = [

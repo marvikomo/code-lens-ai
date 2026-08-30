@@ -1,4 +1,5 @@
 import { Graph } from "graphlib";
+import type { SupportedLanguage } from "./language";
 
 /**
  * Graph schema
@@ -71,7 +72,7 @@ export interface GraphNode {
   name: string;
   /** Absolute path for File/Folder/Repository, otherwise containing file. */
   path?: string;
-  language?: "javascript" | "typescript" | "tsx" | "java";
+  language?: SupportedLanguage;
   range?: SourceRange;
   /** Declaration line(s) — function up to body, full text for type/enum/property. */
   signature?: string;

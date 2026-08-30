@@ -5,6 +5,7 @@ import path from "path";
 import neo4j from "neo4j-driver";
 import {
   analyzeRepository,
+  preloadRepositoryGrammars,
   scanRepository,
   analyzeIncremental,
 } from "./analyser/analyser";
@@ -207,7 +208,7 @@ function parseArgs(argv: string[]): CliArgs {
 
 function printHelp(): void {
   console.log(
-    `codelens - build a code graph from a repository (JS/TS/Java)
+    `codelens - build a code graph from a repository (24 languages)
 
 Usage:
   codelens <subcommand> [args]
@@ -362,6 +363,7 @@ async function main(): Promise<void> {
   }
 
   console.error(`[codelens] analysing ${path.resolve(args.repo)} ...`);
+  await reportGrammarLoad(args.repo, args.ignore);
   const graph = analyzeRepository(args.repo, {
     ignore: args.ignore,
     resolveCallsByName: !args.noResolveCalls,
@@ -628,6 +630,7 @@ async function runIncremental(
     console.error(
       `[codelens] extracting ${toExtract.size} file(s) ...`,
     );
+    await reportGrammarLoad(absRepo, args.ignore);
     const graph = analyzeIncremental(absRepo, {
       ignore: args.ignore,
       resolveCallsByName: !args.noResolveCalls,
@@ -773,3 +776,21 @@ main().catch((err: unknown) => {
   console.error("[codelens] error:", err instanceof Error ? err.stack : err);
   process.exit(1);
 });
+
+/**
+ * Preload the grammars this repo needs and tell the user which languages could
+ * not be loaded, so a missing optional grammar is visible rather than silently
+ * shrinking the graph.
+ */
+async function reportGrammarLoad(
+  repoPath: string,
+  ignore: string[] | undefined,
+): Promise<void> {
+  const { loaded, failed } = await preloadRepositoryGrammars(repoPath, { ignore });
+  if (loaded.length > 0) {
+    console.error(`[codelens] grammars ready: ${loaded.sort().join(", ")}`);
+  }
+  for (const { language, reason } of failed) {
+    console.error(`[codelens] ${language} unavailable — ${reason}`);
+  }
+}

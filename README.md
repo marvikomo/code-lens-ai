@@ -2,7 +2,7 @@
 
 **A code-intelligence MCP server for AI agents.** Index a codebase once, then ask Claude / Cursor / any MCP client to understand it — with answers grounded in the real call graph, real architectural subsystems, and real source code, not hallucinated guesses.
 
-Built on Tree-sitter + Neo4j + Leiden community detection. JS / TS / Java today, polyglot-ready.
+Built on Tree-sitter + Neo4j + Leiden community detection. **24 languages**, with JS / TS / TSX / Java parsed out of the box.
 
 > **From a real session on a ~2,000-file TypeScript monorepo (73 detected subsystems):**
 > *"This is exactly the right tool — it collapses what would be a long exploration into a handful of focused calls, and the community detection produces architectural insight you'd struggle to get from grep."*
@@ -112,6 +112,70 @@ Claude Code, Cursor, Codex, any MCP client
 | "What breaks if I change X?" | educated guess | `impact_analysis` with verdict + cross-community + spine |
 | "What architectural subsystems are here?" | manual reading | `get_overview` (Leiden communities + spine files) |
 | "Write me a wiki" | full-day exploration | `generate_wiki` skeleton in 1 call |
+
+---
+
+## 🌍 Languages
+
+24 languages. Four have hand-written extractors; the other twenty run through a
+config-driven walker (`src/extractor/generic.ts`) fed by one `LanguageConfig`
+per language, so adding a language is normally a config object rather than a new
+extractor.
+
+**Built in — no extra install:**
+
+| Language | Extras beyond the common shape |
+|---|---|
+| JavaScript, TypeScript, TSX | HTTP routes, exports/re-exports, anonymous handlers, state objects |
+| Java | Annotations-based test detection, inner classes |
+
+**Config-driven — install the grammars once:**
+
+```bash
+npm run grammars:install
+```
+
+Python, Go, Rust, Ruby, C#, PHP, Scala, Groovy, C, C++, Objective-C, Kotlin,
+Swift, Elixir, Julia, PowerShell, OCaml, Common Lisp, DreamMaker (DM), Bash.
+
+These extract the shape every language shares: types, interfaces, enums,
+functions, methods, properties, imports, calls, and inheritance.
+
+### Why the grammars are a separate install
+
+Most tree-sitter grammar packages still declare a `tree-sitter@^0.21`/`^0.22`
+peer range even though they load correctly against 0.25. Listing them as
+dependencies makes a strict npm resolver fail the *entire* install, so they are
+opt-in. Anything missing costs you that one language: the indexer logs it once
+and carries on.
+
+### Coverage is not uniform — what you actually get
+
+Every language above was verified by parsing real fixtures and asserting on the
+resulting graph (`src/__tests__/language-configs.test.ts`), not by assuming node
+type names. Known limits, stated rather than papered over:
+
+- **Ruby / Bash** emit no `IMPORTS` edges. `require` and `source` are ordinary
+  call nodes in those grammars, so import edges would have to be invented.
+- **Common Lisp** extracts `defun` only. The grammar leaves `defclass` and
+  `defmethod` as undifferentiated lists and has no call node at all.
+- **C#** writes base classes and interfaces in one undifferentiated `base_list`,
+  so both are emitted as `EXTENDS`.
+- **Python** skips class attributes; they are indistinguishable from
+  module-level constants without type inference.
+- **PowerShell** does not model inheritance — a class and its base are sibling
+  nodes with nothing to tell them apart.
+- **Kotlin** has no distinct interface node, so `interface Foo` appears as a
+  `Class`.
+
+### Languages deliberately absent
+
+Lua, Zig, Verilog, Dart, SQL and Vue have npm grammars that **do not load**
+against tree-sitter 0.25 — they are NAN-era builds that fail with "Invalid
+language object". Svelte and Pascal fail to compile at all, and there is no npm
+grammar for Fortran, Terraform, Astro or Apex. Configs exist for none of them,
+because a config for a grammar that cannot load is a language claimed but not
+delivered.
 
 ---
 
