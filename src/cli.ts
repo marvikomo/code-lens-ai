@@ -21,6 +21,7 @@ import {
 import { clusterInNeo4j } from "./clustering/neo4j-leiden";
 import { runNeo4jSubcommand } from "./cli-commands/neo4j";
 import { runMcpInstall } from "./cli-commands/mcp-install";
+import { runHooksSubcommand } from "./cli-commands/hooks";
 import { computeAndStoreEmbeddings } from "./embeddings/pipeline";
 import { search, type SearchMode } from "./search";
 import { startMcpServer } from "./mcp/server";
@@ -219,6 +220,7 @@ Subcommands:
   mcp                      Start the MCP server (stdio)
   mcp install              Register the MCP server with Claude Code
   neo4j start|stop|status|logs    Manage the bundled Neo4j docker container
+  hooks install|uninstall|status  Keep the index fresh via git hooks
   help                     Show this help
 
   When given a git URL (https://, git@, ssh://), the tool clones into
@@ -275,7 +277,7 @@ MCP server mode (stdio; no <repo-path> needed):
 // Subcommand dispatcher. Inspects argv[0]; falls through to legacy
 // bare-path/flags behavior (treated as `index`) when no known subcommand
 // is given. Keeps `--mcp` flag and bare-path forms working as aliases.
-const KNOWN_SUBCOMMANDS = new Set(["index", "mcp", "neo4j", "help"]);
+const KNOWN_SUBCOMMANDS = new Set(["index", "mcp", "neo4j", "hooks", "help"]);
 
 async function runMcpServerFromArgs(args: CliArgs): Promise<void> {
   if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
@@ -303,6 +305,11 @@ async function main(): Promise<void> {
   if (subcommand === "help") {
     printHelp();
     process.exit(0);
+  }
+
+  if (subcommand === "hooks") {
+    await runHooksSubcommand(tail);
+    return;
   }
 
   if (subcommand === "neo4j") {

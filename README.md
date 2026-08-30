@@ -115,6 +115,28 @@ Claude Code, Cursor, Codex, any MCP client
 
 ---
 
+## 🔄 Keeping the index fresh
+
+The indexer already re-extracts only what changed (`--incremental`, diffed on
+content hashes). What was missing was anything to trigger it, so a graph went
+stale the moment you committed and the only signal was a warning at query time.
+
+```bash
+codelens hooks install          # in the repo you index
+codelens hooks status
+codelens hooks uninstall
+```
+
+That installs `post-commit`, `post-checkout`, `post-merge` and `post-rewrite`,
+so commits, branch switches, `git pull` and rebases all refresh the graph.
+Re-indexing runs detached with its exit status discarded — it can never block
+or fail a git operation.
+
+Existing hooks are appended to, never replaced, and `uninstall` removes only
+the block it added.
+
+---
+
 ## 🌍 Languages
 
 24 languages. Four have hand-written extractors; the other twenty run through a
