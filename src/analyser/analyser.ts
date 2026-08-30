@@ -748,8 +748,10 @@ function confidenceRank(source: EdgeSource): number {
       return 2;
     case "name_only":
       return 3;
-    case "dynamic":
+    case "name_only_ambiguous":
       return 4;
+    case "dynamic":
+      return 5;
   }
 }
 
@@ -801,11 +803,30 @@ function resolveCallsByName(builder: GraphBuilder): void {
       target = candidates!.find((c) => c.path === fromNode.path);
       if (target) source = "static";
     }
-    if (!target) target = candidates![0];
+    // Last resort: several declarations share this name and nothing above
+    // disambiguated. Previously this silently took candidates[0]; the binding
+    // is kept (dropping it would hide real callers from blast radius) but is
+    // tagged so `impact_analysis` can report it as a guess.
+    let ambiguousCandidates: GraphNode[] | null = null;
+    if (!target) {
+      const pool = candidates!;
+      target = pool[0];
+      if (pool.length > 1) {
+        source = "name_only_ambiguous";
+        ambiguousCandidates = pool;
+      }
+    }
 
     const oldTo = edge.to;
     edge.to = target.id;
     edge.source = source;
+    if (ambiguousCandidates) {
+      edge.meta = {
+        ...edge.meta,
+        candidateCount: ambiguousCandidates.length,
+        candidateIds: ambiguousCandidates.slice(0, 5).map((c) => c.id),
+      };
+    }
     delete edge.unresolved;
     edge.id = `${edge.kind}:${edge.from}->${edge.to}`;
     builder.rekeyEdge(edge.from, oldTo, edge.kind, edge);

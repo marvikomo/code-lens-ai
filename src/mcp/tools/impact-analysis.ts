@@ -28,9 +28,31 @@ interface CallerInfo {
   callerPagerank: number;
   callerCommunityId?: number;
   callerCommunityLabel?: string;
+  /** Relation types along the shortest path from this dependent to the target. */
+  rels: string[];
+  /** True when the path is inheritance rather than calls. */
+  isSubtype: boolean;
 }
 
 const HARD_TOTAL_CAP = 80;
+
+/** How many same-named declarations to look at before declaring ambiguity. */
+const AMBIGUITY_PROBE_LIMIT = 10;
+
+/**
+ * Relations traversed when computing blast radius.
+ *
+ * All three point dependent → dependency, so one reverse traversal finds
+ * everything downstream of a change: `CALLS` finds callers, and
+ * `EXTENDS`/`IMPLEMENTS` find subtypes, which a CALLS-only walk missed
+ * entirely — changing a base class showed no subclasses at all.
+ *
+ * File-level relations (`IMPORTS`, `REEXPORTS`) are deliberately excluded:
+ * they connect File nodes, and mixing them into a symbol-level path produces
+ * chains that jump between the two graphs. File-level reach is covered
+ * separately by the precomputed `blastScore`.
+ */
+const IMPACT_RELATIONS = ["CALLS", "EXTENDS", "IMPLEMENTS"] as const;
 
 export function registerImpactAnalysis(
   server: McpServer,
@@ -79,12 +101,15 @@ async function runImpactAnalysis(
      OPTIONAL MATCH (target)<-[:DEFINES]-(targetFile:File)
      OPTIONAL MATCH (targetFile)-[:IN_COMMUNITY]->(targetComm:Community)
      RETURN target, targetFile, targetComm,
+            target.path AS targetPath,
+            target.startRow AS targetStartRow,
             targetFile.is_core AS targetIsCore,
             targetFile.pagerank AS targetPagerank,
             targetFile.boundary AS targetBoundary,
             targetComm.communityId AS targetCommId,
             targetComm.label AS targetCommLabel
-     LIMIT 1`,
+     ORDER BY target.path, target.startRow
+     LIMIT ${AMBIGUITY_PROBE_LIMIT}`,
     targetParams,
   );
   if (targetRows.length === 0) {
@@ -92,7 +117,22 @@ async function runImpactAnalysis(
       `No symbol named "${symbol}" found${file ? ` in files matching "${file}"` : ""}.`,
     );
   }
+  // Several declarations share this name. Analysing an arbitrary one would be
+  // a confidently wrong answer, so ask which — the same stance the graph
+  // resolver takes for ambiguous type references.
+  if (targetRows.length > 1) {
+    const options = targetRows
+      .map((r) => `  - ${String(r.targetPath ?? "?")}:${asNumber(r.targetStartRow) ?? 0}`)
+      .join("\n");
+    return textResult(
+      `"${symbol}" is ambiguous — ${targetRows.length} declarations share that name:\n` +
+        `${options}\n\n` +
+        `Re-run with \`file\` set to a path substring that selects one, ` +
+        `e.g. file: "${String(targetRows[0].targetPath ?? "")}".`,
+    );
+  }
   const tr = targetRows[0];
+  const targetPath = String(tr.targetPath ?? "");
   const target = tr.target as { properties: Record<string, unknown> };
   const targetFile = tr.targetFile as { properties: Record<string, unknown> } | null;
   const targetComm = tr.targetComm as { properties: Record<string, unknown> } | null;
@@ -102,17 +142,19 @@ async function runImpactAnalysis(
   const targetBoundary = asNumber(tr.targetBoundary) ?? 0;
 
   // 2. Pull callers (direct + transitive) with caller-side context.
+  targetParams.targetPath = targetPath;
   const callerRows = await readQuery(
     ctx,
     `MATCH (target:CodeNode { name: $symbol })
      WHERE (target:Function OR target:Method OR target:Class OR target:Variable)
-     ${file ? "AND target.path CONTAINS $file" : ""}
+       AND target.path = $targetPath
      WITH target LIMIT 1
-     MATCH p=(caller)-[:CALLS*1..${d}]->(target)
+     MATCH p=(caller)-[:${IMPACT_RELATIONS.join("|")}*1..${d}]->(target)
      WITH caller,
           collect({
             distance: length(p),
-            sources: [rel IN relationships(p) | coalesce(rel.source, "name_only")]
+            sources: [rel IN relationships(p) | coalesce(rel.source, "name_only")],
+            rels: [rel IN relationships(p) | type(rel)]
           }) AS paths
      WITH caller,
           reduce(minD = 999999, pathInfo IN paths |
@@ -120,7 +162,8 @@ async function runImpactAnalysis(
           ) AS distance,
           paths
      WITH caller, distance,
-          [pathInfo IN paths WHERE pathInfo.distance = distance][0].sources AS sources
+          [pathInfo IN paths WHERE pathInfo.distance = distance][0].sources AS sources,
+          [pathInfo IN paths WHERE pathInfo.distance = distance][0].rels AS rels
      OPTIONAL MATCH (caller)<-[:DEFINES]-(callerFile:File)
      OPTIONAL MATCH (callerFile)-[:IN_COMMUNITY]->(callerComm:Community)
      RETURN caller.name AS name,
@@ -128,6 +171,7 @@ async function runImpactAnalysis(
             caller.startRow AS startRow,
             distance,
             sources,
+            rels,
             callerFile.is_core AS callerIsCore,
             callerFile.pagerank AS callerPagerank,
             callerFile.isTest AS callerIsTest,
@@ -136,7 +180,13 @@ async function runImpactAnalysis(
     targetParams,
   );
 
-  const allCallers: CallerInfo[] = callerRows.map((r) => ({
+  const allCallers: CallerInfo[] = callerRows.map((r) => {
+    const rels = Array.isArray(r.rels) ? r.rels.map(String) : [];
+    return {
+    rels,
+    // Any inheritance hop makes this an inheritance relationship rather than
+    // a call, and it is reported in its own section.
+    isSubtype: rels.some((t) => t === "EXTENDS" || t === "IMPLEMENTS"),
     name: String(r.name ?? "(anonymous)"),
     path: String(r.path ?? ""),
     startRow: asNumber(r.startRow) ?? 0,
@@ -146,13 +196,21 @@ async function runImpactAnalysis(
     callerPagerank: asNumber(r.callerPagerank) ?? 0,
     callerCommunityId: asNumber(r.callerCommId),
     callerCommunityLabel: (r.callerCommLabel as string | null) ?? undefined,
-  }));
+    };
+  });
+
+  // Subtypes are impact, but they are not callers — keeping them out of the
+  // caller counts stops a class with many subclasses from reading as a
+  // heavily-called function.
+  const subtypes = allCallers.filter((c) => c.isSubtype);
 
   // distance==1 callers are direct; rest are transitive.
   const direct = callerRows
-    .map((r, i) => (asNumber(r.distance) === 1 ? allCallers[i] : null))
+    .map((r, i) =>
+      asNumber(r.distance) === 1 && !allCallers[i].isSubtype ? allCallers[i] : null,
+    )
     .filter((c): c is CallerInfo => c !== null);
-  const transitive = allCallers; // includes direct + indirect
+  const transitive = allCallers.filter((c) => !c.isSubtype);
 
   const prodDirect = direct.filter((c) => !c.isTest);
   const testDirect = direct.filter((c) => c.isTest);
@@ -211,6 +269,7 @@ async function runImpactAnalysis(
       prodTransitive,
       testTransitive,
       spineCallers,
+      subtypes,
       confidence,
       otherCommunities,
       callerCommunityIds,
@@ -291,6 +350,7 @@ function computeVerdict(args: {
 interface ConfidenceSummary {
   high: number;
   nameOnly: number;
+  ambiguous: number;
   dynamic: number;
   total: number;
   bySource: Record<string, number>;
@@ -306,14 +366,18 @@ function summarizeConfidence(callers: CallerInfo[]): ConfidenceSummary {
     (bySource.via_imports ?? 0) +
     (bySource.via_reexport ?? 0);
   const nameOnly = bySource.name_only ?? 0;
+  const ambiguous = bySource.name_only_ambiguous ?? 0;
   const dynamic = bySource.dynamic ?? 0;
-  return { high, nameOnly, dynamic, total: callers.length, bySource };
+  return { high, nameOnly, ambiguous, dynamic, total: callers.length, bySource };
 }
 
 function confidenceSentence(c: ConfidenceSummary): string {
   if (c.total === 0) return "0 visible callers at any confidence.";
   const parts = [`${c.high} high-confidence`];
   if (c.nameOnly > 0) parts.push(`${c.nameOnly} name-only`);
+  // Called out separately from plain name-only: these were a pick among
+  // several same-named declarations, so the caller may not belong here at all.
+  if (c.ambiguous > 0) parts.push(`${c.ambiguous} ambiguous-name (guessed)`);
   if (c.dynamic > 0) parts.push(`${c.dynamic} dynamic/heuristic`);
   return `Confidence: ${parts.join(", ")}.`;
 }
@@ -406,6 +470,7 @@ interface RenderArgs {
   prodTransitive: CallerInfo[];
   testTransitive: CallerInfo[];
   spineCallers: CallerInfo[];
+  subtypes: CallerInfo[];
   confidence: ConfidenceSummary;
   otherCommunities: number[];
   callerCommunityIds: Set<number>;
@@ -475,6 +540,25 @@ function renderImpactAnalysis(a: RenderArgs): string {
   out.push("");
 
   // Spine callers (dedicated section).
+  // Subtypes — reachable via EXTENDS/IMPLEMENTS rather than CALLS. A
+  // CALLS-only traversal reported none of these.
+  if (a.subtypes.length > 0) {
+    out.push("## Subtypes affected");
+    out.push("");
+    out.push(
+      `${a.subtypes.length} type${a.subtypes.length === 1 ? "" : "s"} inherit${a.subtypes.length === 1 ? "s" : ""} from the target — a signature or contract change reaches these:`,
+    );
+    out.push("");
+    for (const t of a.subtypes.slice(0, 20)) {
+      const via = t.rels.includes("IMPLEMENTS") ? "implements" : "extends";
+      out.push(`- \`${t.name}\` (${via}) — ${t.path}:${t.startRow + 1}`);
+    }
+    if (a.subtypes.length > 20) {
+      out.push(`- …and ${a.subtypes.length - 20} more`);
+    }
+    out.push("");
+  }
+
   out.push("## Spine callers");
   out.push("");
   if (a.spineCallers.length === 0) {

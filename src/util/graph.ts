@@ -54,6 +54,12 @@ export type EdgeSource =
   | "via_imports"
   | "via_reexport"
   | "name_only"
+  // Bound by name when SEVERAL declarations share that name, so the specific
+  // target was a guess among candidates. The edge is kept rather than dropped
+  // — for blast radius, omitting a real caller is worse than over-including a
+  // flagged one — but consumers must surface the uncertainty.
+  // `meta.candidateCount` / `meta.candidateIds` carry the alternatives.
+  | "name_only_ambiguous"
   | "dynamic";
 
 export interface Position {

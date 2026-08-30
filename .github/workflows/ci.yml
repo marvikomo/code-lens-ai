@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json declares engines.node >=18; test the low and high ends.
+        node: ['18', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx tsc --noEmit
+
+      - run: npm run build
+
+      # The optional grammars are not dependencies (most declare a stale
+      # tree-sitter ^0.21/^0.22 peer range that breaks a strict resolver), so
+      # CI installs them explicitly. Without them the language suite fails
+      # loudly rather than skipping — which is the point: these packages are
+      # third-party native builds and they break without warning.
+      - name: Install optional tree-sitter grammars
+        run: npm run grammars:install
+
+      - run: npm test
