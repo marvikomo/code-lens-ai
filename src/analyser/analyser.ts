@@ -467,11 +467,35 @@ function resolveImports(
   fileNodes: Map<string, GraphNode>,
   builder: GraphBuilder,
 ): void {
+  const moduleIndex = buildModuleIndex(fileNodes);
+
   for (const imp of pending) {
     const fromNode = builder.getNode(imp.from);
     if (!fromNode || !fromNode.path) continue;
 
     const targetFile = resolveSpec(fromNode, imp.spec, fileNodes);
+
+    // Non-relative module specifiers (`go.k6.io/k6/lib/netext`,
+    // `graphify.extractors.base`) never look like a relative path, so the
+    // JS-shaped resolver above returns nothing for them. Without this the
+    // file-import graph is empty for most non-JS languages — k6 produced 6
+    // IMPORTS edges across 3,482 files, which makes community detection and
+    // spine selection meaningless there.
+    if (!targetFile) {
+      const moduleTargets = resolveModuleSpec(imp.spec, moduleIndex);
+      if (moduleTargets.length > 0) {
+        for (const target of moduleTargets) {
+          if (target.id === fromNode.id) continue;
+          builder.addEdge({
+            kind: "IMPORTS",
+            from: fromNode.id,
+            to: target.id,
+          });
+        }
+        continue;
+      }
+    }
+
     if (targetFile) {
       builder.addEdge({
         kind: "IMPORTS",
@@ -523,6 +547,109 @@ function resolveImports(
       }
     }
   }
+}
+
+/**
+ * Path-suffix index over indexed files, used to bind non-relative module
+ * specifiers to files.
+ *
+ * Keyed by every trailing path fragment up to `MODULE_SUFFIX_DEPTH` segments,
+ * both for files (extension stripped) and for their directories — a Go import
+ * names a package directory, while a Python or Java one names a module file.
+ */
+interface ModuleIndex {
+  readonly byFileSuffix: Map<string, GraphNode[]>;
+  readonly byDirSuffix: Map<string, GraphNode[]>;
+}
+
+const MODULE_SUFFIX_DEPTH = 8;
+
+/**
+ * A suffix must be at least this many segments to bind.
+ *
+ * Single-segment specifiers are overwhelmingly standard library (`fmt`, `os`,
+ * `strings`, `sys`), and binding those to a same-named repo file would invent
+ * dependencies. The cost is missing a genuine single-module local import; the
+ * conservative direction is the right one here.
+ */
+const MODULE_MIN_SEGMENTS = 2;
+
+function buildModuleIndex(fileNodes: Map<string, GraphNode>): ModuleIndex {
+  const byFileSuffix = new Map<string, GraphNode[]>();
+  const byDirSuffix = new Map<string, GraphNode[]>();
+
+  const push = (
+    map: Map<string, GraphNode[]>,
+    key: string,
+    node: GraphNode,
+  ): void => {
+    const bucket = map.get(key);
+    if (bucket) bucket.push(node);
+    else map.set(key, [node]);
+  };
+
+  for (const [filePath, node] of fileNodes) {
+    const ext = path.extname(filePath);
+    const withoutExt = ext ? filePath.slice(0, -ext.length) : filePath;
+    const segments = withoutExt.split(/[/\\]/).filter(Boolean);
+    if (segments.length === 0) continue;
+
+    const start = Math.max(0, segments.length - MODULE_SUFFIX_DEPTH);
+    for (let i = start; i < segments.length; i++) {
+      push(byFileSuffix, segments.slice(i).join("/"), node);
+    }
+
+    const dirSegments = segments.slice(0, -1);
+    const dirStart = Math.max(0, dirSegments.length - MODULE_SUFFIX_DEPTH);
+    for (let i = dirStart; i < dirSegments.length; i++) {
+      push(byDirSuffix, dirSegments.slice(i).join("/"), node);
+    }
+  }
+
+  return { byFileSuffix, byDirSuffix };
+}
+
+/**
+ * Resolve a non-relative module specifier to the file(s) it names.
+ *
+ * Longest suffix wins, so `go.k6.io/k6/lib/netext` prefers the deepest
+ * matching path before falling back to `lib/netext` and then `netext`.
+ * A file match must be unique; a directory match must resolve to exactly one
+ * directory, in which case every file in that package is a target — importing
+ * a Go package does depend on all of it.
+ *
+ * Ambiguity yields nothing rather than a guess, matching how the type-reference
+ * resolver treats competing candidates.
+ */
+function resolveModuleSpec(spec: string, index: ModuleIndex): GraphNode[] {
+  const cleaned = spec.trim().replace(/\.\*$/, "").replace(/^["'`]|["'`]$/g, "");
+  if (!cleaned) return [];
+
+  // Path-shaped specifiers (Go, and anything quoting a path) keep their
+  // slashes; dotted ones (Python, Java, Kotlin, Scala) split on the dot. A Go
+  // specifier's leading domain segment contains dots, so splitting on both
+  // would shred it.
+  const segments = (cleaned.includes("/") ? cleaned.split("/") : cleaned.split("."))
+    .map((seg) => seg.trim())
+    .filter(Boolean);
+  if (segments.length < MODULE_MIN_SEGMENTS) return [];
+
+  for (let i = 0; i + MODULE_MIN_SEGMENTS <= segments.length; i++) {
+    const key = segments.slice(i).join("/");
+
+    const fileMatches = index.byFileSuffix.get(key);
+    if (fileMatches && fileMatches.length === 1) return fileMatches;
+
+    const dirMatches = index.byDirSuffix.get(key);
+    if (dirMatches && dirMatches.length > 0) {
+      const dirs = new Set(
+        dirMatches.map((n) => (n.path ? path.dirname(n.path) : "")),
+      );
+      if (dirs.size === 1) return dirMatches;
+    }
+  }
+
+  return [];
 }
 
 function resolveSpec(

@@ -1,4 +1,12 @@
 import neo4j, { Driver, ManagedTransaction, Session } from "neo4j-driver";
+import {
+  computeFileMetrics,
+  FileVertex,
+  ImportEdge,
+} from "./graph-metrics";
+
+/** Property writes per statement — keeps the parameter payload bounded. */
+const WRITE_BATCH = 1000;
 
 export interface ClusterOptions {
   uri: string;
@@ -11,8 +19,6 @@ export interface ClusterOptions {
   spineBoundary?: number;
   /** Materialize :Community nodes only for groups with size >= this. Default 3. */
   minSize?: number;
-  /** GDS in-memory projection name. Default "ast-cluster". */
-  projectionName?: string;
   /** Wipe community props + :Community nodes before running. */
   clear?: boolean;
 }
@@ -22,17 +28,27 @@ export interface ClusterReport {
   materialized: number;
   spineNodes: number;
   filesScored: number;
+  /** Newman modularity of the partition — log it to catch quality regressions. */
+  modularity: number;
 }
 
 /**
- * Runs Leiden community detection on the File-IMPORTS subgraph already in Neo4j.
+ * Clusters the File-IMPORTS subgraph and writes the results back to Neo4j.
  *
- * Sequence: preflight → optional clear → drop stale projection → project →
- * Leiden → PageRank → boundary degree → per-community spine tagging →
- * materialize :Community nodes → drop projection (finally).
+ * Sequence: optional clear → read the File-IMPORTS subgraph → compute
+ * communities, PageRank, boundary degree, blast radius and spine locally →
+ * write properties back → materialize :Community nodes with heuristic labels.
  *
- * Requires the Neo4j Graph Data Science plugin (gds.*). Throws with a
- * helpful message if it's missing.
+ * **No longer requires the Graph Data Science plugin.** The analytics moved
+ * in-process (see `graph-metrics.ts`): the clustered graph is the File graph,
+ * a few thousand nodes even on a large monorepo, and requiring a Docker
+ * plugin plus a `gds.*` security allowlist to compute it was by far the
+ * heaviest part of getting `get_overview` to produce anything.
+ *
+ * Community detection is Louvain rather than GDS's Leiden. Leiden's advantage
+ * is avoiding internally-disconnected communities; at this graph size the
+ * partitions are close, and `modularity` is returned so the quality is
+ * observable rather than assumed.
  */
 export async function clusterInNeo4j(
   opts: ClusterOptions,
@@ -42,7 +58,6 @@ export async function clusterInNeo4j(
     neo4j.auth.basic(opts.user, opts.password),
   );
   const sessionConfig = opts.database ? { database: opts.database } : {};
-  const name = opts.projectionName ?? "ast-cluster";
   const spinePagerank = opts.spinePagerank ?? 5;
   const spineBoundary = opts.spineBoundary ?? 3;
   const minSize = opts.minSize ?? 3;
@@ -78,15 +93,6 @@ export async function clusterInNeo4j(
   };
 
   try {
-    // 0. Preflight — confirm GDS is installed.
-    try {
-      await runRead(`RETURN gds.version() AS v`);
-    } catch (err) {
-      throw new Error(
-        `GDS plugin not installed or not allowlisted. Edit docker-compose.yml to add "graph-data-science" to NEO4J_PLUGINS and "gds.*" to NEO4J_dbms_security_procedures_unrestricted, then 'docker compose down && docker compose up -d'. Underlying error: ${(err as Error).message}`,
-      );
-    }
-
     // 1. Optional clear.
     if (opts.clear) {
       await run(`MATCH (c:Community) DETACH DELETE c`);
@@ -96,90 +102,55 @@ export async function clusterInNeo4j(
       );
     }
 
-    // 2. Drop stale projection from a previous crashed run.
-    await run(
-      `CALL gds.graph.exists($name) YIELD exists
-       WITH exists WHERE exists
-       CALL gds.graph.drop($name) YIELD graphName RETURN graphName`,
-      { name },
+    // 2. Read the File-IMPORTS subgraph out of the store. This is the graph
+    //    GDS used to project; it is the File graph, not the symbol graph, so
+    //    it is small — a few thousand nodes even on a large monorepo.
+    const fileRows = await runRead(`MATCH (f:File) RETURN f.path AS id`);
+    const edgeRows = await runRead(
+      `MATCH (a:File)-[:IMPORTS]->(b:File)
+       RETURN a.path AS from, b.path AS to`,
     );
+    const files: FileVertex[] = fileRows
+      .map((r) => ({ id: String(r.id ?? "") }))
+      .filter((f) => f.id !== "");
+    const importEdges: ImportEdge[] = edgeRows
+      .map((r) => ({ from: String(r.from ?? ""), to: String(r.to ?? "") }))
+      .filter((e) => e.from !== "" && e.to !== "");
 
-    // 3. Native projection — :File nodes + :IMPORTS edges, undirected.
-    // :IMPORTS → :Unresolved is auto-skipped (Unresolved isn't in the node set).
-    //
-    // Note (2026-05): we tried using gds.leiden.write's `seedProperty` to
-    // preserve community IDs across re-runs (per the architecture-recovery
-    // literature). GDS's implementation produced runaway over-merging
-    // (back-to-back runs collapsed 99% of files into one community), and
-    // placeholder seed values leaked into the output. Reverted; ID stability
-    // will be handled via post-clustering Jaccard label migration instead.
-    await run(
-      `CALL gds.graph.project($name, 'File',
-         { IMPORTS: { orientation: 'UNDIRECTED' } })`,
-      { name },
-    );
+    // 3. Community detection, PageRank, boundary degree, blast radius and
+    //    spine selection — all in process. Previously eight `gds.*` calls,
+    //    which is why the tool needed the GDS plugin installed and
+    //    security-allowlisted before it produced anything.
+    const metrics = computeFileMetrics(files, importEdges, {
+      spinePagerank,
+      spineBoundary,
+    });
 
-    // 4. Leiden — deterministic for identical input via randomSeed.
-    await run(
-      `CALL gds.leiden.write($name, {
-         writeProperty: 'community',
-         concurrency: 4,
-         randomSeed: 42
-       }) YIELD communityCount, modularity`,
-      { name },
-    );
-
-    // 5. PageRank.
-    await run(
-      `CALL gds.pageRank.write($name, { writeProperty: 'pagerank' })
-       YIELD nodePropertiesWritten`,
-      { name },
-    );
-
-    // 6. Boundary degree — count distinct neighbors in *other* communities.
-    await run(
-      `MATCH (f:File)
-       OPTIONAL MATCH (f)-[r:IMPORTS]-(other:File)
-       WHERE other.community <> f.community
-       WITH f, count(DISTINCT other) AS boundary
-       SET f.boundary = boundary`,
-    );
-
-    // 6b. Blast radius — how many files break (directly or transitively) if
-    //     this file changes. Counts files that IMPORT this one (directed),
-    //     unlike Leiden which projects undirected. Formula matches codeindex
-    //     so numbers are comparable across tools:
-    //       blastScore = directCount + 0.5 * transitiveCount
-    //     where direct = importers in one hop, transitive = importers reachable
-    //     in 2..8 hops (capping at 8 keeps the traversal bounded on large
-    //     monorepos — beyond 8 hops "depends on" stops being a meaningful
-    //     signal anyway). Files with no importers get blastScore = 0.
-    await run(
-      `MATCH (f:File)
-       OPTIONAL MATCH (direct:File)-[:IMPORTS]->(f)
-       WITH f, count(DISTINCT direct) AS directCount
-       OPTIONAL MATCH (transitive:File)-[:IMPORTS*1..8]->(f)
-       WITH f, directCount, count(DISTINCT transitive) AS totalCount
-       SET f.blastDirect = directCount,
-           f.blastTransitive = totalCount - directCount,
-           f.blastScore = toFloat(directCount) + 0.5 * toFloat(totalCount - directCount)`,
-    );
-
-    // 7. Per-community spine — top-K PageRank, then top-M boundary (additive).
-    await run(
-      `MATCH (f:File) WHERE f.community IS NOT NULL
-       WITH f.community AS c, f ORDER BY f.pagerank DESC
-       WITH c, collect(f)[0..$k] AS top
-       UNWIND top AS f SET f.is_core = true`,
-      { k: neo4j.int(spinePagerank) },
-    );
-    await run(
-      `MATCH (f:File) WHERE f.community IS NOT NULL AND f.boundary > 0
-       WITH f.community AS c, f ORDER BY f.boundary DESC
-       WITH c, collect(f)[0..$k] AS top
-       UNWIND top AS f SET f.is_core = true`,
-      { k: neo4j.int(spineBoundary) },
-    );
+    // 4. Write the computed properties back in one batched statement.
+    const payload = [...metrics.byFile.entries()].map(([id, m]) => ({
+      path: id,
+      community: neo4j.int(m.community),
+      pagerank: m.pagerank,
+      boundary: neo4j.int(m.boundary),
+      blastDirect: neo4j.int(m.blastDirect),
+      blastTransitive: neo4j.int(m.blastTransitive),
+      blastScore: m.blastScore,
+      isCore: m.isCore,
+    }));
+    for (let i = 0; i < payload.length; i += WRITE_BATCH) {
+      await run(
+        `UNWIND $rows AS row
+         MATCH (f:File { path: row.path })
+         SET f.community = row.community,
+             f.pagerank = row.pagerank,
+             f.boundary = row.boundary,
+             f.blastDirect = row.blastDirect,
+             f.blastTransitive = row.blastTransitive,
+             f.blastScore = row.blastScore,
+             f.is_core = row.isCore`,
+        { rows: payload.slice(i, i + WRITE_BATCH) },
+      );
+    }
 
     // 8a. Drop all :Community nodes from prior runs — Leiden assigns fresh
     //     community IDs on each unseeded run, so old :Community nodes would
@@ -264,17 +235,9 @@ export async function clusterInNeo4j(
       materialized: num("materialized"),
       spineNodes: num("spineNodes"),
       filesScored: num("filesScored"),
+      modularity: metrics.modularity,
     };
   } finally {
-    // Cleanup — drop the projection if it still exists.
-    try {
-      await run(
-        `CALL gds.graph.drop($name, false) YIELD graphName RETURN graphName`,
-        { name },
-      );
-    } catch {
-      // ignore — projection may never have been created
-    }
     await driver.close();
   }
 }

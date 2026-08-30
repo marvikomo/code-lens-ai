@@ -192,7 +192,7 @@ delivered.
 # Install the CLI globally
 npm install -g @marvikomo/codelens-ai
 
-# Start the bundled Neo4j (image: neo4j:5.15 with APOC + GDS plugins)
+# Start the bundled Neo4j (image: neo4j:5.15 with the APOC plugin)
 codelens neo4j start
 
 # Index a repo + run Leiden clustering
@@ -309,7 +309,7 @@ codelens help                                   # show top-level help
 --neo4j-clear          # DETACH DELETE all :CodeNode before re-indexing
 --incremental          # re-index only changed files (git-aware), cascading to dependents
 
-# Clustering (requires Neo4j GDS plugin)
+# Clustering (no plugin required — computed in process)
 --cluster              # run Leiden + PageRank + spine selection
 --cluster-only         # skip indexing; just re-cluster
 --cluster-clear        # wipe community props + labels first
@@ -371,7 +371,7 @@ Every indexed codebase gets:
 
 ## 🏗️ Architecture (one paragraph)
 
-The CLI walks a repo, parses each file with **Tree-sitter** (Java + JS/TS), runs language-specific extractors that emit nodes (functions, classes, etc.) and edges (calls, imports) into an in-memory `graphlib` graph. The graph is bulk-pushed to **Neo4j** with a uniqueness constraint on `:CodeNode(id)`. After indexing, the **GDS plugin** runs Leiden community detection + PageRank + boundary degree on the file-IMPORTS subgraph, then per-community spine selection writes `is_core: true` on the most-central files. Optionally, **`@xenova/transformers`** computes 768-dim vector embeddings for Function/Method/Class bodies (jina-base-code model, in-process, ~161 MB). At query time, the **MCP server** exposes 10 tools that translate agent intent into Cypher / FTS / vector queries against this graph and shape the results into either decision-support prose (impact_analysis), structural facts (generate_wiki), or raw data (cypher).
+The CLI walks a repo, parses each file with **Tree-sitter** (24 languages), runs language-specific extractors that emit nodes (functions, classes, etc.) and edges (calls, imports) into an in-memory `graphlib` graph. The graph is bulk-pushed to **Neo4j** with a uniqueness constraint on `:CodeNode(id)`. After indexing, community detection (Louvain), PageRank, boundary degree and blast radius run **in process** over the file-IMPORTS subgraph — a few thousand nodes even on a large monorepo — and per-community spine selection writes `is_core: true` on the most-central files. No Neo4j GDS plugin is required. Optionally, **`@xenova/transformers`** computes 768-dim vector embeddings for Function/Method/Class bodies (jina-base-code model, in-process, ~161 MB). At query time, the **MCP server** exposes 10 tools that translate agent intent into Cypher / FTS / vector queries against this graph and shape the results into either decision-support prose (impact_analysis), structural facts (generate_wiki), or raw data (cypher).
 
 ---
 
@@ -383,7 +383,7 @@ src/
 ├── extractor/        # per-language tree-sitter walkers (jsts.ts, java.ts, base.ts)
 ├── util/             # graph data model, language detection, parser factory
 ├── indexers/         # Neo4j bulk-write
-├── clustering/       # Neo4j GDS Leiden + PageRank + spine
+├── clustering/       # In-process Louvain + PageRank + blast + spine
 ├── embeddings/       # @xenova/transformers wrapper + batch pipeline
 ├── search/           # FTS, vector, hybrid (RRF) implementations
 ├── mcp/              # MCP server + 10 tool implementations
