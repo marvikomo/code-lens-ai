@@ -47,6 +47,7 @@ export class JavaExtractor implements LanguageExtractor {
           from: ctx.fileNode.id,
           to: cls.id,
         });
+        this.exportType(cls, ctx);
         this.handleHeritage(node, cls, ctx);
         const body = node.childForFieldName("body");
         if (body) {
@@ -64,6 +65,7 @@ export class JavaExtractor implements LanguageExtractor {
           from: ctx.fileNode.id,
           to: iface.id,
         });
+        this.exportType(iface, ctx);
         // Interface bodies contain method signatures; treat as methods.
         const body = node.childForFieldName("body");
         if (body) {
@@ -78,6 +80,21 @@ export class JavaExtractor implements LanguageExtractor {
     for (const child of node.namedChildren) {
       this.visit(child, ctx);
     }
+  }
+
+  /**
+   * A Java type is importable by its `package.Type` name, so record it as an
+   * export. Without this the resolver has no import-aware path for Java and
+   * binds every cross-file reference by bare name.
+   */
+  private exportType(type: GraphNode, ctx: ExtractContext): void {
+    if (type.name === "<anonymous>") return;
+    ctx.builder.addEdge({
+      kind: "EXPORTS",
+      from: ctx.fileNode.id,
+      to: type.id,
+      meta: { exportedName: type.name },
+    });
   }
 
   private makeClass(

@@ -69,6 +69,12 @@ export const go: LanguageConfig = {
     "uint8", "uint16", "uint32", "uint64", "uintptr", "any", "comparable",
   ],
 
+  // Go encodes visibility in the identifier: only a capitalised name is
+  // importable from another package. Advertising `helper` as exported would
+  // let the import-aware resolver bind cross-package calls that the compiler
+  // would reject.
+  isExported: (_node, name) => /^[A-Z]/.test(name),
+
   testDetector: (root) =>
     root
       .descendantsOfType("function_declaration")

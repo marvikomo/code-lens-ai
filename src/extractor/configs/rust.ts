@@ -28,6 +28,11 @@ export const rust: LanguageConfig = {
       : undefined,
   implementsFields: ["trait"],
 
+  // Rust marks visibility syntactically; a item without `pub` is crate- or
+  // module-private and is not importable elsewhere.
+  isExported: (node) =>
+    node.namedChildren.some((c) => c.type === "visibility_modifier"),
+
   builtinCallNames: [
     "println", "print", "eprintln", "eprint", "format", "vec", "write",
     "writeln", "panic", "assert", "assert_eq", "assert_ne", "debug_assert",

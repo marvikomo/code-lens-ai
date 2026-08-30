@@ -376,6 +376,7 @@ async function main(): Promise<void> {
     for (const e of graph.edges) eCounts[e.kind] = (eCounts[e.kind] ?? 0) + 1;
     console.error("[codelens] node counts:", counts);
     console.error("[codelens] edge counts:", eCounts);
+    reportCallResolution(graph);
   }
 
   // ── JSON output ─────────────────────────────────────────────────────
@@ -646,6 +647,7 @@ async function runIncremental(
       for (const e of graph.edges) eCounts[e.kind] = (eCounts[e.kind] ?? 0) + 1;
       console.error("[codelens] node counts:", counts);
       console.error("[codelens] edge counts:", eCounts);
+      reportCallResolution(graph);
     }
 
     // Push without --neo4j-clear; MERGE semantics handle the partial graph.
@@ -793,4 +795,37 @@ async function reportGrammarLoad(
   for (const { language, reason } of failed) {
     console.error(`[codelens] ${language} unavailable — ${reason}`);
   }
+}
+
+/**
+ * Report how much of the call graph is actually resolved, and how confidently.
+ *
+ * Every downstream feature — impact analysis, spine selection, the wiki — is
+ * only as trustworthy as this number, so it is printed rather than left to be
+ * assumed. Unbound calls are mostly calls into external libraries and are
+ * expected; the figure worth watching is the ambiguous share, which counts
+ * bindings picked from several same-named declarations.
+ */
+function reportCallResolution(graph: { edges: { kind: string; source?: string; unresolved?: string }[] }): void {
+  const calls = graph.edges.filter((e) => e.kind === "CALLS");
+  if (calls.length === 0) return;
+
+  const bySource: Record<string, number> = {};
+  for (const e of calls) {
+    const key = e.unresolved ? "unbound" : (e.source ?? "unknown");
+    bySource[key] = (bySource[key] ?? 0) + 1;
+  }
+  const bound = calls.length - (bySource.unbound ?? 0);
+  const high =
+    (bySource.static ?? 0) +
+    (bySource.via_imports ?? 0) +
+    (bySource.via_reexport ?? 0);
+  const ambiguous = bySource.name_only_ambiguous ?? 0;
+  const pct = (n: number, d: number) => (d === 0 ? 0 : Math.round((100 * n) / d));
+
+  console.error(
+    `[codelens] call resolution: ${bound}/${calls.length} bound (${pct(bound, calls.length)}%) — ` +
+      `${pct(high, bound)}% high-confidence, ${pct(ambiguous, bound)}% ambiguous-name`,
+  );
+  console.error("[codelens] call confidence:", bySource);
 }

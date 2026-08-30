@@ -21,7 +21,9 @@ let graph: CodeGraph;
 
 beforeAll(async () => {
   await preloadRepositoryGrammars(FIXTURES);
-  graph = analyzeRepository(FIXTURES, { resolveCallsByName: false });
+  // Call resolution on: the last assertions check that imports feed the
+  // import-aware binding path, not just that IMPORTS edges exist.
+  graph = analyzeRepository(FIXTURES, { resolveCallsByName: true });
 }, 60_000);
 
 /** Resolved IMPORTS edges out of a file, as target basenames. */
@@ -76,5 +78,46 @@ describe("ambiguity", () => {
     const targets = importsFrom("ambiguous.go");
     expect(targets).not.toContain("thing.go");
     expect(unresolvedFrom("ambiguous.go")).toContain("example.com/proj/shared");
+  });
+});
+
+describe("EXPORTS edges and import-aware call resolution", () => {
+  const exportsOf = (basename: string): string[] =>
+    graph.edges
+      .filter((e) => e.kind === "EXPORTS" && e.from.endsWith(basename))
+      .map((e) => String(e.meta?.exportedName ?? ""));
+
+  it("records file-level declarations as exports", () => {
+    // Without EXPORTS the resolver's import-aware path cannot fire at all,
+    // which is why every non-JS language resolved purely by bare name.
+    expect(exportsOf("base.py")).toEqual(
+      expect.arrayContaining(["Base", "make_base"]),
+    );
+  });
+
+  it("respects Go capitalisation when deciding what is importable", () => {
+    const exported = exportsOf("dialer.go");
+    expect(exported).toContain("Dial");
+    // `prepare` is package-private; advertising it would let the resolver bind
+    // cross-package calls the Go compiler would reject.
+    expect(exported).not.toContain("prepare");
+  });
+
+  it("does not export methods, only file-level declarations", () => {
+    // A method is reached through its owner, not imported by name.
+    expect(exportsOf("base.py")).not.toContain("__init__");
+  });
+
+  it("binds a cross-file call through the caller's imports", () => {
+    const edge = graph.edges.find(
+      (e) =>
+        e.kind === "CALLS" &&
+        e.from.includes("importer.py") &&
+        e.to.includes("base.py") &&
+        e.to.includes("make_base"),
+    );
+    expect(edge).toBeDefined();
+    // The whole point: import-verified rather than a name guess.
+    expect(edge!.source).toBe("via_imports");
   });
 });

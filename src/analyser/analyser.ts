@@ -930,6 +930,24 @@ function resolveCallsByName(builder: GraphBuilder): void {
       target = candidates!.find((c) => c.path === fromNode.path);
       if (target) source = "static";
     }
+    // Same-directory fallback. In languages where a directory is the module or
+    // package unit (Go, and by convention most others), a call is far more
+    // likely to mean the declaration sitting beside it than an identically
+    // named one across the repo. Narrowing to the caller's directory before
+    // the global pool turns a large share of otherwise-arbitrary picks into
+    // defensible ones — on k6, where method names like `Run` and `Close`
+    // repeat across dozens of types, this is the difference between a guess
+    // and a reasonable inference.
+    if (!target && fromNode?.path) {
+      const callerDir = path.dirname(fromNode.path);
+      const sameDir = candidates!.filter(
+        (c) => c.path && path.dirname(c.path) === callerDir,
+      );
+      if (sameDir.length === 1) {
+        target = sameDir[0];
+        source = "name_only";
+      }
+    }
     // Last resort: several declarations share this name and nothing above
     // disambiguated. Previously this silently took candidates[0]; the binding
     // is kept (dropping it would hide real callers from blast radius) but is

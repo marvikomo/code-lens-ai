@@ -111,6 +111,7 @@ export class GenericExtractor implements LanguageExtractor {
       from: ctx.fileNode.id,
       to: typeNode.id,
     });
+    this.exportIfVisible(node, typeNode, ctx);
 
     this.handleHeritage(node, typeNode, ctx);
 
@@ -139,6 +140,7 @@ export class GenericExtractor implements LanguageExtractor {
       from: ctx.fileNode.id,
       to: typeNode.id,
     });
+    this.exportIfVisible(node, typeNode, ctx);
   }
 
   /**
@@ -165,6 +167,9 @@ export class GenericExtractor implements LanguageExtractor {
         ? { kind: "HAS_METHOD", from: owner.id, to: fnNode.id }
         : { kind: "DEFINES", from: ctx.fileNode.id, to: fnNode.id },
     );
+    // Only file-level declarations are importable; a method is reached
+    // through its owner, not by name from another file.
+    if (!owner) this.exportIfVisible(node, fnNode, ctx);
 
     const callScope =
       this.config.callScope === "body" ? this.bodyOf(node) : node;
@@ -176,6 +181,31 @@ export class GenericExtractor implements LanguageExtractor {
     if (body) {
       for (const child of body.namedChildren) this.visit(child, ctx);
     }
+  }
+
+  /**
+   * Record a file-level declaration as importable.
+   *
+   * Without these edges the resolver's import-aware path cannot fire at all
+   * and every cross-file call falls back to matching on bare name — which is
+   * exactly what happened for every language except JS/TS.
+   */
+  private exportIfVisible(
+    node: SyntaxNode,
+    declaration: GraphNode,
+    ctx: ExtractContext,
+  ): void {
+    if (declaration.name === ANONYMOUS) return;
+    const visible = this.config.isExported
+      ? this.config.isExported(node, declaration.name)
+      : true;
+    if (!visible) return;
+    ctx.builder.addEdge({
+      kind: "EXPORTS",
+      from: ctx.fileNode.id,
+      to: declaration.id,
+      meta: { exportedName: declaration.name },
+    });
   }
 
   private handleProperty(

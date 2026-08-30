@@ -157,6 +157,18 @@ export interface LanguageConfig {
   /** Pull the module specifier out of an import node. */
   readonly importSpec?: (node: SyntaxNode) => string | undefined;
 
+  /**
+   * Whether a file-level declaration is visible to other files.
+   *
+   * Drives the EXPORTS edges that let the resolver bind a call through the
+   * caller's imports (`via_imports`) instead of guessing by name. Defaults to
+   * true — in most languages every top-level declaration is importable.
+   * Languages that encode visibility syntactically (Go's capitalisation,
+   * Rust's `pub`) override it so package-private symbols do not advertise
+   * themselves as importable.
+   */
+  readonly isExported?: (node: SyntaxNode, name: string) => boolean;
+
   /** Detect a test file, returning the framework name. */
   readonly testDetector?: (root: SyntaxNode) => string | null;
 
