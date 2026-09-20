@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ToolContext } from "../server";
-import { readQuery, asNumber, textResult, int } from "../util";
+import { textResult } from "../util";
 
 // Defaults tuned to fit within typical Claude Code MCP result limits
 // (~15K tokens) on big repos. All overridable via tool args at call time.
@@ -140,281 +140,60 @@ async function runGenerateWiki(
   const maxCommunities = args.maxCommunities ?? COMMUNITIES_RENDER_CAP_DEFAULT;
   const glossaryLimit = args.glossaryLimit ?? GLOSSARY_LIMIT_DEFAULT;
   // Run the independent queries in parallel — biggest perf win.
+  const store = ctx.store;
   const [
-    repoRows,
-    countRows,
-    languageRows,
+    repoMeta,
+    counts,
+    languages,
     communityRows,
-    spineRows,
-    topFnRows,
-    crossRows,
-    routeRows,
-    entryRows,
-    testRows,
-    glossaryRows,
-    externalRows,
-    coverageRows,
-    topBlastRows,
+    spine,
+    topFns,
+    cross,
+    routes,
+    entries,
+    tests,
+    glossary,
+    externals,
+    coverage,
+    topBlast,
   ] = await Promise.all([
-    readQuery(
-      ctx,
-      `MATCH (r:Repository)
-       RETURN r.name AS name, r.path AS path,
-              r.lastIndexed AS lastIndexed, r.lastCommit AS lastCommit
-       LIMIT 1`,
-    ),
-    readQuery(
-      ctx,
-      `MATCH (n:CodeNode)
-       WITH labels(n) AS labels
-       UNWIND labels AS l
-       WITH l, count(*) AS c WHERE l <> 'CodeNode'
-       RETURN l AS kind, c AS count ORDER BY count DESC`,
-    ),
-    readQuery(
-      ctx,
-      `MATCH (f:File) WHERE f.language IS NOT NULL
-       RETURN f.language AS language, count(*) AS count ORDER BY count DESC`,
-    ),
-    readQuery(
-      ctx,
-      // Fetch the current spine PATHS + contentHashes alongside the
-      // snapshot so describeDescriptionFreshness can detect content drift
-      // (same shape as get-overview.ts — see comments there).
-      `MATCH (c:Community)<-[:IN_COMMUNITY]-(f:File)
-       OPTIONAL MATCH (c)<-[:IN_COMMUNITY]-(curSpine:File {is_core: true})
-       WITH c, count(DISTINCT f) AS size,
-            collect(DISTINCT { path: curSpine.path, hash: curSpine.contentHash }) AS curSpineInfo
-       WITH c, size,
-            [x IN curSpineInfo WHERE x.path IS NOT NULL | x.path] AS currentSpine,
-            [x IN curSpineInfo WHERE x.path IS NOT NULL | coalesce(x.hash, '')] AS currentSpineHashes
-       RETURN c.communityId AS id, c.label AS label,
-              c.heuristicLabel AS heuristicLabel,
-              c.description AS description,
-              c.descriptionWrittenAt AS descriptionWrittenAt,
-              c.descriptionSpineSnapshot AS descriptionSpineSnapshot,
-              c.descriptionSpineHashes AS descriptionSpineHashes,
-              currentSpine, currentSpineHashes, size
-       ORDER BY size DESC`,
-    ),
-    readQuery(
-      ctx,
-      `MATCH (c:Community)<-[:IN_COMMUNITY]-(f:File)
-       WHERE f.is_core = true
-       WITH c.communityId AS cid, f
-       ORDER BY f.pagerank DESC
-       RETURN cid, f.path AS path, f.name AS name, f.pagerank AS pagerank`,
-    ),
-    readQuery(
-      ctx,
-      `MATCH (c:Community)<-[:IN_COMMUNITY]-(f:File)-[:DEFINES]->(fn:Function)
-       OPTIONAL MATCH (fn)<-[r:CALLS]-(:CodeNode)
-       WITH c.communityId AS cid, fn, count(r) AS callCount
-       WHERE callCount > 0
-       RETURN cid, fn.name AS name, fn.signature AS signature,
-              fn.path AS path, fn.startRow AS startRow, callCount
-       ORDER BY callCount DESC`,
-    ),
-    readQuery(
-      ctx,
-      `MATCH (c1:Community)<-[:IN_COMMUNITY]-(:File)-[:IMPORTS]->(:File)-[:IN_COMMUNITY]->(c2:Community)
-       WHERE c1 <> c2
-       RETURN c1.communityId AS fromId, c1.label AS fromLabel,
-              c1.heuristicLabel AS fromHeuristic,
-              c2.communityId AS toId, c2.label AS toLabel,
-              c2.heuristicLabel AS toHeuristic,
-              count(*) AS count`,
-    ),
-    readQuery(
-      ctx,
-      `MATCH (n:Function) WHERE n.httpMethod IS NOT NULL
-       RETURN n.httpMethod AS method, n.route AS route,
-              n.path AS path, n.startRow AS startRow
-       ORDER BY n.path, n.startRow`,
-    ),
-    readQuery(
-      ctx,
-      `MATCH (f:File) WHERE NOT (f)<-[:IMPORTS]-()
-       RETURN f.path AS path ORDER BY f.path`,
-    ),
-    readQuery(
-      ctx,
-      `MATCH (f:File) WHERE f.isTest = true
-       RETURN f.path AS path, f.testFramework AS framework
-       ORDER BY f.path`,
-    ),
-    readQuery(
-      ctx,
-      `MATCH (target)<-[r:CALLS]-(:CodeNode)
-       WHERE (target:Function OR target:Method) AND target.name IS NOT NULL
-       WITH target, count(r) AS callCount
-       ORDER BY callCount DESC LIMIT $limit
-       RETURN target.name AS name, target.signature AS signature,
-              target.path AS path, target.startRow AS startRow, callCount`,
-      { limit: int(glossaryLimit) },
-    ),
-    readQuery(
-      ctx,
-      // Skip Java stdlib (java.*, javax.*) — every Java file imports it, so it
-      // would dominate the per-community top-N and crowd out actionable signal
-      // like Spring/Hibernate/etc.
-      `MATCH (c:Community)<-[:IN_COMMUNITY]-(:File)-[:IMPORTS]->(u:Unresolved)
-       WHERE u.symbol IS NOT NULL
-         AND NOT u.symbol STARTS WITH 'java.'
-         AND NOT u.symbol STARTS WITH 'javax.'
-       WITH c.communityId AS cid, u.symbol AS spec, count(*) AS uses
-       RETURN cid, spec, uses
-       ORDER BY cid, uses DESC`,
-    ),
-    readQuery(
-      ctx,
-      // Subsystem coverage — files NOT in any materialized :Community are
-      // invisible to every per-subsystem render below. Surface the gap honestly
-      // so the reader can calibrate trust in the wiki's completeness.
-      `MATCH (f:File)
-       OPTIONAL MATCH (f)-[ic:IN_COMMUNITY]->(:Community)
-       WITH count(f) AS total, count(ic) AS clustered,
-            collect(CASE WHEN ic IS NULL THEN f.path END) AS rawOrphans
-       RETURN total, clustered,
-              [p IN rawOrphans WHERE p IS NOT NULL] AS orphans`,
-    ),
-    // Top-15 by blast — high-blast file rendering, see get-overview.ts for
-    // the formula commentary. Adjacent to Entry points in the wiki so readers
-    // see the contrast: high-blast = "files everyone leans on";
-    // entry points = "files no one imports."
-    readQuery(
-      ctx,
-      `MATCH (f:File)
-       WHERE f.blastScore IS NOT NULL AND f.blastScore > 0
-       OPTIONAL MATCH (f)-[:IN_COMMUNITY]->(c:Community)
-       RETURN f.path AS path,
-              f.blastScore AS blast,
-              f.blastDirect AS direct,
-              f.blastTransitive AS transitive,
-              f.is_core AS isSpine,
-              coalesce(c.label, c.heuristicLabel,
-                       CASE WHEN c.communityId IS NOT NULL
-                            THEN 'community-' + toString(c.communityId)
-                            ELSE '(no community)' END) AS community
-       ORDER BY f.blastScore DESC
-       LIMIT 15`,
-    ),
+    store.repositoryMeta(),
+    store.countsByKind(),
+    store.languageCounts(),
+    store.communities(),
+    store.spineFiles(),
+    store.topFunctionsByCommunity(),
+    store.crossCommunityImports(),
+    store.routes(),
+    store.entryPoints(),
+    store.testFiles(),
+    store.glossary(glossaryLimit),
+    store.externalDepsByCommunity(),
+    store.clusterCoverage(),
+    store.topBlastFiles(15),
   ]);
 
-  const repo = repoRows[0] ?? { name: "(unknown)", path: "(unknown)" };
-  const repoLastIndexed = (repo.lastIndexed as string | undefined) ?? null;
-  const repoLastCommit = (repo.lastCommit as string | undefined) ?? null;
+  const repo = repoMeta ?? { name: "(unknown)", path: "(unknown)", lastIndexed: null, lastCommit: null };
 
-  const counts = countRows.map((r) => ({
-    kind: String(r.kind),
-    count: asNumber(r.count) ?? 0,
-  }));
-
-  const languages = languageRows.map((r) => ({
-    language: String(r.language),
-    count: asNumber(r.count) ?? 0,
-  }));
-
-  const communities: CommunityRow[] = communityRows.map((r) => ({
-    id: asNumber(r.id) ?? 0,
-    label: (r.label as string | null) ?? null,
-    heuristicLabel: (r.heuristicLabel as string | null) ?? null,
-    description: (r.description as string | null) ?? null,
-    descriptionWrittenAt:
-      (r.descriptionWrittenAt as string | null) ?? null,
-    descriptionSpineSnapshot: Array.isArray(r.descriptionSpineSnapshot)
-      ? (r.descriptionSpineSnapshot as unknown[]).map(String)
-      : [],
-    descriptionSpineHashes: Array.isArray(r.descriptionSpineHashes)
-      ? (r.descriptionSpineHashes as unknown[]).map(String)
-      : [],
-    currentSpine: Array.isArray(r.currentSpine)
-      ? (r.currentSpine as unknown[]).map(String)
-      : [],
-    currentSpineHashes: Array.isArray(r.currentSpineHashes)
-      ? (r.currentSpineHashes as unknown[]).map(String)
-      : [],
-    size: asNumber(r.size) ?? 0,
-  }));
-
-  const spine: SpineFile[] = spineRows.map((r) => ({
-    cid: asNumber(r.cid) ?? 0,
-    path: String(r.path),
-    name: String(r.name),
-    pagerank: asNumber(r.pagerank) ?? 0,
-  }));
-
-  const topFns: TopFn[] = topFnRows.map((r) => ({
-    cid: asNumber(r.cid) ?? 0,
-    name: String(r.name ?? "(anonymous)"),
-    signature: (r.signature as string | null) ?? null,
-    path: String(r.path ?? ""),
-    startRow: asNumber(r.startRow) ?? 0,
-    callCount: asNumber(r.callCount) ?? 0,
-  }));
-
-  const cross: CrossEdge[] = crossRows.map((r) => ({
-    fromId: asNumber(r.fromId) ?? 0,
-    fromLabel: (r.fromLabel as string | null) ?? null,
-    fromHeuristic: (r.fromHeuristic as string | null) ?? null,
-    toId: asNumber(r.toId) ?? 0,
-    toLabel: (r.toLabel as string | null) ?? null,
-    toHeuristic: (r.toHeuristic as string | null) ?? null,
-    count: asNumber(r.count) ?? 0,
-  }));
-
-  const routes: Route[] = routeRows.map((r) => ({
-    method: String(r.method),
-    route: String(r.route ?? ""),
-    path: String(r.path ?? ""),
-    startRow: asNumber(r.startRow) ?? 0,
-  }));
-
-  const entries: string[] = entryRows.map((r) => String(r.path));
-
-  const tests: TestFile[] = testRows.map((r) => ({
-    path: String(r.path),
-    framework: (r.framework as string | null) ?? null,
-  }));
-
-  const glossary: GlossaryEntry[] = glossaryRows.map((r) => ({
-    name: String(r.name),
-    signature: (r.signature as string | null) ?? null,
-    path: String(r.path ?? ""),
-    startRow: asNumber(r.startRow) ?? 0,
-    callCount: asNumber(r.callCount) ?? 0,
-  }));
-
-  const externals: ExternalImport[] = externalRows.map((r) => ({
-    cid: asNumber(r.cid) ?? 0,
-    spec: String(r.spec),
-    uses: asNumber(r.uses) ?? 0,
-  }));
-
-  const coverageRow = coverageRows[0] ?? { total: 0, clustered: 0, orphans: [] };
-  const coverage: CoverageStats = {
-    total: asNumber(coverageRow.total) ?? 0,
-    clustered: asNumber(coverageRow.clustered) ?? 0,
-    orphans: Array.isArray(coverageRow.orphans)
-      ? (coverageRow.orphans as unknown[]).map((p) => String(p))
-      : [],
-  };
-
-  const topBlast: BlastFile[] = topBlastRows.map((r) => ({
-    path: String(r.path ?? ""),
-    blast: asNumber(r.blast) ?? 0,
-    direct: asNumber(r.direct) ?? 0,
-    transitive: asNumber(r.transitive) ?? 0,
-    isSpine: Boolean(r.isSpine),
-    community: (r.community as string | null) ?? "(no community)",
+  const communities: CommunityRow[] = communityRows.map((c) => ({
+    id: c.id,
+    label: c.label,
+    heuristicLabel: c.heuristicLabel,
+    description: c.description,
+    descriptionWrittenAt: c.descriptionWrittenAt,
+    descriptionSpineSnapshot: c.descriptionSpineSnapshot,
+    descriptionSpineHashes: c.descriptionSpineHashes,
+    currentSpine: c.spine.map((s) => s.path),
+    currentSpineHashes: c.spine.map((s) => s.hash),
+    size: c.size,
   }));
 
   return textResult(
     renderWiki({
-      repoName: String(repo.name),
-      repoPath: String(repo.path),
-      lastIndexed: repoLastIndexed,
-      lastCommit: repoLastCommit,
+      repoName: repo.name,
+      repoPath: repo.path,
+      lastIndexed: repo.lastIndexed,
+      lastCommit: repo.lastCommit,
       counts,
       languages,
       communities,

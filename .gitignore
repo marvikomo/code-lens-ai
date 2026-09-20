@@ -26,3 +26,5 @@ output/
 test-dir/
 repo/
 tree-sitters
+# codelens local index
+.codelens/

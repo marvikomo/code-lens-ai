@@ -353,3 +353,43 @@ export function computeFileMetrics(
     modularity: detailed.modularity,
   };
 }
+
+/**
+ * Folder segments that name a location rather than a subsystem. A community
+ * whose members all sit under `src/lib/` should not be called "src".
+ */
+const LABEL_STOP_SEGMENTS: ReadonlySet<string> = new Set([
+  "src", "lib", "libs", "dist", "build", "out", "bin",
+  "app", "pkg", "packages", "node_modules", "vendor", "target",
+  "index", "main",
+  "tests", "test", "__tests__", "spec", "__mocks__", "mocks",
+  "common", "shared", "public", "private", "internal",
+]);
+
+/**
+ * Fallback community name when no agent has labelled it: the most common
+ * informative folder segment among the members' repo-relative paths.
+ * `libs/auth/login.ts` + `libs/auth/session.ts` → "auth". Segments with a
+ * dot (file names), single characters and the stop-list are ignored. Ties
+ * break alphabetically so the label is stable across runs. Null when no
+ * segment qualifies.
+ */
+export function heuristicLabelFor(relPaths: readonly string[]): string | null {
+  const counts = new Map<string, number>();
+  for (const p of relPaths) {
+    for (const seg of p.split("/")) {
+      if (seg === "" || seg.includes(".") || seg.length <= 1) continue;
+      if (LABEL_STOP_SEGMENTS.has(seg)) continue;
+      counts.set(seg, (counts.get(seg) ?? 0) + 1);
+    }
+  }
+  let best: string | null = null;
+  let bestCount = 0;
+  for (const [seg, n] of counts) {
+    if (n > bestCount || (n === bestCount && best !== null && seg < best)) {
+      best = seg;
+      bestCount = n;
+    }
+  }
+  return best;
+}

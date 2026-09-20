@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ToolContext } from "../server";
-import { search, type SearchMode } from "../../search";
+import type { SearchMode } from "../../search";
 import { textResult } from "../util";
 
 // Cast as Record<string, any> to short-circuit TS's deep schema inference.
@@ -55,11 +55,10 @@ export function registerSearchCode(server: McpServer, ctx: ToolContext): void {
       inputSchema: searchCodeSchema,
     },
     async ({ query, mode, kind, limit }) => {
-      const hits = await search(ctx.driver, query, {
+      const hits = await ctx.store.search(query, {
         mode: mode as SearchMode | undefined,
         kind,
         limit: limit ?? 10,
-        database: ctx.database,
       });
       if (hits.length === 0) {
         return textResult(`No hits for "${query}".`);

@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ToolContext } from "../server";
-import { readQuery, asNumber, nodeKind, textResult, int } from "../util";
+import { textResult } from "../util";
 
 const getCalleesSchema: Record<string, any> = {
   symbol: z.string().describe("Name of the calling function/method to expand."),
@@ -44,49 +44,27 @@ export function registerGetCallees(
     async ({ symbol, file, depth, limit }) => {
       const d = depth ?? 1;
       const lim = limit ?? 30;
-      const fileFilter = file ? "AND src.path CONTAINS $file" : "";
-      const params: Record<string, unknown> = {
-        symbol,
-        lim: int(lim),
-      };
-      if (file) params.file = file;
+      const rows = await ctx.store.callees(symbol, {
+        pathContains: file,
+        depth: d,
+        limit: lim,
+      });
 
-      const records = await readQuery(
-        ctx,
-        `MATCH (src:CodeNode { name: $symbol })
-         WHERE src:Function OR src:Method ${fileFilter}
-         WITH src LIMIT 5
-         MATCH (src)-[r:CALLS*1..${d}]->(target)
-         WITH DISTINCT target, size(r) AS distance
-         RETURN target, distance
-         ORDER BY distance, target.name
-         LIMIT $lim`,
-        params,
-      );
-
-      if (records.length === 0) {
+      if (rows.length === 0) {
         return textResult(
           `No callees found for "${symbol}"${file ? ` in ${file}` : ""}.`,
         );
       }
 
-      const lines = records.map((r) => {
-        const target = r.target as {
-          properties: Record<string, unknown>;
-          labels: string[];
-        };
-        const p = target.properties;
-        const k = nodeKind(target.labels);
-        const distance = asNumber(r.distance);
-        const name = p.name ?? p.symbol ?? "(unknown)";
-        const loc = p.path
-          ? `${p.path}:${(asNumber(p.startRow) ?? 0) + 1}`
+      const lines = rows.map((r) => {
+        const loc = r.target.path
+          ? `${r.target.path}:${(r.target.startRow ?? 0) + 1}`
           : "(external)";
-        return `- [d=${distance}] ${k} ${name}\n    ${loc}`;
+        return `- [d=${r.distance}] ${r.target.kind} ${r.target.name}\n    ${loc}`;
       });
 
       return textResult(
-        `${records.length} callee(s) of "${symbol}" (depth ≤ ${d}):\n\n` +
+        `${rows.length} callee(s) of "${symbol}" (depth ≤ ${d}):\n\n` +
           lines.join("\n"),
       );
     },

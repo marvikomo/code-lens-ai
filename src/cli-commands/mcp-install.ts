@@ -1,7 +1,10 @@
 import { spawnSync } from "child_process";
+import path from "path";
 
 interface InstallArgs {
   scope: "local" | "user" | "project";
+  /** Repo whose `.codelens/` index the server should serve (local backend). */
+  repo?: string;
   neo4jUri?: string;
   neo4jUser?: string;
   neo4jPassword?: string;
@@ -20,16 +23,16 @@ Options:
                                    local   - this directory only
                                    user    - available in all your projects
                                    project - shared via .mcp.json in repo
-  --neo4j-uri <uri>              e.g. bolt://localhost:7687
+  --repo <path>                  Serve the local index at <path>/.codelens
+                                 (default: current directory). No Neo4j needed.
+  --neo4j-uri <uri>              Use a Neo4j backend instead, e.g. bolt://localhost:7687
   --neo4j-user <name>            e.g. neo4j
   --neo4j-password <pw>          e.g. password
   --neo4j-database <name>        (optional) target database
   -h, --help                     Show this help
 
-If --neo4j-* flags are omitted, falls back to NEO4J_URI / NEO4J_USER /
-NEO4J_PASSWORD / NEO4J_DATABASE env vars. If none are set, registration
-still completes but the server will fail at runtime until credentials
-are available.`,
+Without --neo4j-* flags (or NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD env
+vars) the server reads the local index written by \`codelens index\`.`,
   );
 }
 
@@ -49,6 +52,9 @@ function parseInstallArgs(argv: string[]): InstallArgs {
         args.scope = s;
         break;
       }
+      case "--repo":
+        args.repo = path.resolve(argv[++i]);
+        break;
       case "--neo4j-uri":
         args.neo4jUri = argv[++i];
         break;
@@ -79,26 +85,25 @@ function parseInstallArgs(argv: string[]): InstallArgs {
 }
 
 function manualConfigSnippet(args: InstallArgs): string {
-  const env: Record<string, string> = {
-    NEO4J_URI: args.neo4jUri ?? "bolt://localhost:7687",
-    NEO4J_USER: args.neo4jUser ?? "neo4j",
-    NEO4J_PASSWORD: args.neo4jPassword ?? "password",
+  const server: Record<string, unknown> = {
+    command: "npx",
+    args: ["-y", "@marvikomo/codelens-ai", "mcp", ...serverArgs(args)],
   };
-  if (args.neo4jDatabase) env.NEO4J_DATABASE = args.neo4jDatabase;
-  const json = JSON.stringify(
-    {
-      mcpServers: {
-        codelens: {
-          command: "npx",
-          args: ["-y", "@marvikomo/codelens-ai", "mcp"],
-          env,
-        },
-      },
-    },
-    null,
-    2,
-  );
-  return json;
+  if (args.neo4jUri) {
+    const env: Record<string, string> = {
+      NEO4J_URI: args.neo4jUri,
+      NEO4J_USER: args.neo4jUser ?? "neo4j",
+      NEO4J_PASSWORD: args.neo4jPassword ?? "password",
+    };
+    if (args.neo4jDatabase) env.NEO4J_DATABASE = args.neo4jDatabase;
+    server.env = env;
+  }
+  return JSON.stringify({ mcpServers: { codelens: server } }, null, 2);
+}
+
+/** Arguments after `mcp`: the repo to serve when there is no Neo4j. */
+function serverArgs(args: InstallArgs): string[] {
+  return args.neo4jUri ? [] : ["--repo", args.repo ?? process.cwd()];
 }
 
 function ensureClaudeCli(args: InstallArgs): void {
@@ -126,9 +131,11 @@ export async function runMcpInstall(argv: string[]): Promise<void> {
     args.scope,
   ];
 
-  const haveCreds =
-    args.neo4jUri && args.neo4jUser && args.neo4jPassword;
-  if (haveCreds) {
+  if (args.neo4jUri) {
+    if (!args.neo4jUser || !args.neo4jPassword) {
+      console.error("[codelens] --neo4j-uri needs --neo4j-user and --neo4j-password");
+      process.exit(2);
+    }
     cmdArgs.push("--env", `NEO4J_URI=${args.neo4jUri}`);
     cmdArgs.push("--env", `NEO4J_USER=${args.neo4jUser}`);
     cmdArgs.push("--env", `NEO4J_PASSWORD=${args.neo4jPassword}`);
@@ -136,16 +143,14 @@ export async function runMcpInstall(argv: string[]): Promise<void> {
       cmdArgs.push("--env", `NEO4J_DATABASE=${args.neo4jDatabase}`);
     }
   } else {
+    const repo = args.repo ?? process.cwd();
     console.error(
-      "[codelens] warning: no Neo4j credentials provided. The MCP server will fail " +
-        "to start until you set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD in your shell " +
-        "env, or re-install with:\n" +
-        "  codelens mcp install --neo4j-uri bolt://localhost:7687 \\\n" +
-        "                       --neo4j-user neo4j --neo4j-password password",
+      `[codelens] registering the local backend for ${repo}\n` +
+        `           (run \`codelens index ${repo}\` first if you haven't)`,
     );
   }
 
-  cmdArgs.push("--", "npx", "-y", "@marvikomo/codelens-ai", "mcp");
+  cmdArgs.push("--", "npx", "-y", "@marvikomo/codelens-ai", "mcp", ...serverArgs(args));
 
   const r = spawnSync("claude", cmdArgs, { stdio: "inherit" });
   if (r.status !== 0) {

@@ -23,8 +23,16 @@ import { runNeo4jSubcommand } from "./cli-commands/neo4j";
 import { runMcpInstall } from "./cli-commands/mcp-install";
 import { runHooksSubcommand } from "./cli-commands/hooks";
 import { computeAndStoreEmbeddings } from "./embeddings/pipeline";
+import { createJudge } from "./ai/judge";
+import { tagFileLayers, type TagLayersReport } from "./ai/layers";
+import type { CodeGraph } from "./util/graph";
 import { search, type SearchMode } from "./search";
 import { startMcpServer } from "./mcp/server";
+import { openStore } from "./store";
+import { LocalStore } from "./store/local";
+import { buildLocalIndex } from "./store/build";
+import { isLocalDirIgnored, localIndexExists, readLocalIndex, LOCAL_DIR } from "./store/persist";
+import { computeLocalEmbeddings } from "./embeddings/local-index";
 import { resolveSource } from "./util/repo-source";
 import {
   gitCommitDelta,
@@ -65,12 +73,20 @@ interface CliArgs {
   embed: boolean;
   embedModel?: string;
   embedBatch?: number;
+  // Semantic layer tagging (TypeSafe System One)
+  layers: boolean;
+  layersModel?: string;
+  layersMinConfidence?: number;
   // Search
   searchQuery?: string;
   searchMode?: SearchMode;
   searchLimit?: number;
   // MCP server
   mcp: boolean;
+  /** Dump the graph as JSON to stdout (the pre-1.1 default when no Neo4j was given). */
+  json: boolean;
+  /** Ignore NEO4J_* env vars and use the local backend. */
+  local: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -88,7 +104,10 @@ function parseArgs(argv: string[]): CliArgs {
     clusterOnly: false,
     clusterClear: false,
     embed: false,
+    layers: false,
     mcp: false,
+    json: false,
+    local: false,
   };
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
@@ -163,6 +182,15 @@ function parseArgs(argv: string[]): CliArgs {
       case "--embed-batch":
         args.embedBatch = Number(argv[++i]);
         break;
+      case "--layers":
+        args.layers = true;
+        break;
+      case "--layers-model":
+        args.layersModel = argv[++i];
+        break;
+      case "--layers-min-confidence":
+        args.layersMinConfidence = Number(argv[++i]);
+        break;
       case "--search":
         args.searchQuery = argv[++i];
         break;
@@ -183,6 +211,17 @@ function parseArgs(argv: string[]): CliArgs {
       case "--mcp":
         args.mcp = true;
         break;
+      case "--json":
+        args.json = true;
+        break;
+      case "--local":
+        // Force the local backend even when NEO4J_URI is set in the environment.
+        args.local = true;
+        break;
+      case "--repo":
+        // `codelens mcp --repo <path>`: which local index to serve.
+        rest.push(argv[++i]);
+        break;
       case "-h":
       case "--help":
         printHelp();
@@ -199,12 +238,63 @@ function parseArgs(argv: string[]): CliArgs {
     args.repo = ".";
   }
 
-  // Env-var fallbacks for credentials.
-  args.neo4jUri ??= process.env.NEO4J_URI;
-  args.neo4jUser ??= process.env.NEO4J_USER;
-  args.neo4jPassword ??= process.env.NEO4J_PASSWORD;
-  args.neo4jDatabase ??= process.env.NEO4J_DATABASE;
+  // Env-var fallbacks for credentials, unless the user asked for local.
+  if (args.local) {
+    args.neo4jUri = undefined;
+  } else {
+    args.neo4jUri ??= process.env.NEO4J_URI;
+    args.neo4jUser ??= process.env.NEO4J_USER;
+    args.neo4jPassword ??= process.env.NEO4J_PASSWORD;
+    args.neo4jDatabase ??= process.env.NEO4J_DATABASE;
+  }
   return args;
+}
+
+/**
+ * Tag every File node with an architectural layer via TypeSafe. Runs on the
+ * in-memory graph so the tags reach both the JSON output and Neo4j. Exits
+ * when the flag is set but no key is configured — a silent no-op would leave
+ * the user thinking the graph was tagged.
+ */
+async function runLayerTagging(
+  graph: CodeGraph,
+  repoPath: string,
+  args: CliArgs,
+  only?: Set<string>,
+): Promise<TagLayersReport | null> {
+  const judge = createJudge({ model: args.layersModel });
+  if (!judge) {
+    console.error(
+      "[codelens] --layers requires TYPESAFE_API_KEY in the environment (see https://docs.typesafe.ai)",
+    );
+    process.exit(2);
+  }
+  const total = only
+    ? only.size
+    : graph.nodes.filter((n) => n.kind === "File").length;
+  console.error(`[codelens] tagging ${total} file(s) with semantic layers ...`);
+  const startedAt = Date.now();
+  const report = await tagFileLayers(graph, judge, {
+    repoPath,
+    only,
+    minConfidence: args.layersMinConfidence,
+    onProgress: (done, all) => {
+      if (done === all || done % 10 === 0) {
+        console.error(`[codelens]   layers: ${done}/${all} requests`);
+      }
+    },
+  });
+  const breakdown = Object.entries(report.byLayer)
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([layer, n]) => `${layer}=${n}`)
+    .join(", ");
+  const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+  console.error(
+    `[codelens] layers: ${report.tagged} tagged (${report.lowConfidence} low-confidence, ` +
+      `${report.failed} failed) in ${report.requests} request(s), ${seconds}s — ${breakdown}`,
+  );
+  return report;
 }
 
 function printHelp(): void {
@@ -217,7 +307,7 @@ Usage:
 
 Subcommands:
   index <path>             Analyze + index a repo (default if no subcommand)
-  mcp                      Start the MCP server (stdio)
+  mcp [--repo <path>]      Start the MCP server (stdio) over a local index
   mcp install              Register the MCP server with Claude Code
   neo4j start|stop|status|logs    Manage the bundled Neo4j docker container
   hooks install|uninstall|status  Keep the index fresh via git hooks
@@ -227,12 +317,20 @@ Subcommands:
   ~/.code-lens-aI/cache/<host>/<owner>/<name>/ and indexes from there.
   Re-running with the same URL syncs the clone before indexing.
 
+Storage — pick one:
+  Local (default)          No services. \`codelens index <repo>\` writes <repo>/.codelens/
+                           with the graph, communities and spine; \`codelens mcp\`
+                           serves it. Community labels persist across re-indexes.
+      --local                  Use the local backend even if NEO4J_URI is set
+  Neo4j (optional)         Pass --neo4j-uri (or set NEO4J_URI) to store the graph
+                           in Neo4j instead. Adds the free-form \`cypher\` tool.
+
 General:
-  -o, --out <file>             Write JSON to file (default: stdout)
+  -o, --out <file>             Also write the graph as JSON to a file
+      --json                   Also print the graph as JSON to stdout
       --ignore <a,b,c>         Extra folder/file names to ignore
       --no-pretty              Compact JSON output
       --no-resolve-calls       Keep CALLS edges fully unresolved
-      --no-json                Do not emit JSON (use with --neo4j-uri)
       --stats                  Print summary stats to stderr
 
 Neo4j (also reads NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD / NEO4J_DATABASE):
@@ -245,30 +343,39 @@ Neo4j (also reads NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD / NEO4J_DATABASE):
       --incremental            Re-index only changed files (git-aware when
                                target is a git repo; sha256-based otherwise).
                                Cascades to dependents so CALLS edges stay correct.
+                               Local backend: skips when HEAD is unchanged and the
+                               tree is clean, otherwise rebuilds (a few seconds).
 
-Clustering (requires Neo4j + GDS plugin; runs after indexing):
-      --cluster                Run Leiden community detection on File-IMPORTS
-      --cluster-only           Only run clustering against existing graph (skip
-                               analyze/index/embed). No <repo-path> needed.
-                               Preserves existing embeddings.
+Clustering (local: always on; Neo4j: runs after indexing with --cluster):
+      --cluster                Run community detection on the File-IMPORTS graph
+      --cluster-only           Only re-cluster the existing index (skip
+                               analyze/index/embed). Preserves embeddings.
       --cluster-clear          Wipe community props + :Community nodes first
       --cluster-spine-pagerank <n>   Per-community top-K by PageRank (default 5)
       --cluster-spine-boundary <n>   Per-community top-K by boundary degree (default 3)
       --cluster-min-size <n>         Min files to materialize a :Community node (default 3)
 
-Embeddings (requires Neo4j; downloads ~161 MB model on first run):
+Embeddings (downloads ~161 MB model on first run; local or Neo4j):
       --embed                  Compute embeddings for all Function/Method/Class nodes
       --embed-model <hf-id>    Override default jinaai/jina-embeddings-v2-base-code
       --embed-batch <n>        Batch size for the embedding model (default 32)
+
+Semantic layers (requires TYPESAFE_API_KEY; runs before indexing):
+      --layers                 Ask TypeSafe's Jev model which architectural layer
+                               each file belongs to (api_surface, ui, business_logic,
+                               data_access, infrastructure, configuration, utilities,
+                               tests, unclear). Stored as File.layer / File.layerConfidence.
+      --layers-model <id>      Override the model (default jev-latest)
+      --layers-min-confidence <0-1>  Report picks under this as low-confidence (default 0.6)
 
 Search (runs against existing graph; can run with no <repo-path>):
       --search "<query>"       Run a search and print top hits
       --search-mode <m>        fts | vector | hybrid (auto if omitted)
       --search-limit <n>       Top-N results (default 20)
 
-MCP server mode (stdio; no <repo-path> needed):
-      --mcp                    Start the Model Context Protocol server.
-                               Wire into Claude Desktop/Cursor/Codex configs.
+MCP server mode (stdio):
+      --mcp                    Alias for \`codelens mcp\`. Local index of --repo /
+                               current directory, or Neo4j when NEO4J_URI is set.
 
   -h, --help                   Show this help`,
   );
@@ -280,19 +387,16 @@ MCP server mode (stdio; no <repo-path> needed):
 const KNOWN_SUBCOMMANDS = new Set(["index", "mcp", "neo4j", "hooks", "help"]);
 
 async function runMcpServerFromArgs(args: CliArgs): Promise<void> {
-  if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
-    console.error(
-      "[codelens] mcp requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password " +
-        "or NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD env vars)",
-    );
-    process.exit(2);
-  }
-  await startMcpServer({
+  // Neo4j when credentials were given; otherwise the local index of the
+  // repo named by --repo / positional (default: current directory).
+  const store = await openStore({
     neo4jUri: args.neo4jUri,
     neo4jUser: args.neo4jUser,
     neo4jPassword: args.neo4jPassword,
     neo4jDatabase: args.neo4jDatabase,
+    repo: args.repo || ".",
   });
+  await startMcpServer(store);
 }
 
 async function main(): Promise<void> {
@@ -376,6 +480,8 @@ async function main(): Promise<void> {
     resolveCallsByName: !args.noResolveCalls,
   });
 
+  if (args.layers) await runLayerTagging(graph, path.resolve(args.repo), args);
+
   if (args.stats) {
     const counts: Record<string, number> = {};
     for (const n of graph.nodes) counts[n.kind] = (counts[n.kind] ?? 0) + 1;
@@ -387,7 +493,7 @@ async function main(): Promise<void> {
   }
 
   // ── JSON output ─────────────────────────────────────────────────────
-  if (!args.noJson) {
+  if (!args.noJson && (args.out || args.json)) {
     // Strip the live graphlib reference from the JSON payload.
     const payload = { nodes: graph.nodes, edges: graph.edges };
     const json = args.pretty
@@ -398,10 +504,16 @@ async function main(): Promise<void> {
       const outPath = path.resolve(args.out);
       fs.writeFileSync(outPath, json, "utf8");
       console.error(`[codelens] wrote ${outPath}`);
-    } else if (!args.neo4jUri) {
-      // Only stream to stdout if we're not also writing to neo4j (keeps logs clean).
+    } else {
       process.stdout.write(json + "\n");
     }
+  }
+
+  // ── Local index (no Neo4j) ─────────────────────────────────────────
+  // Metrics are always computed here — they are cheap and every tool that
+  // mentions communities needs them — so `--cluster` is implied.
+  if (!args.neo4jUri) {
+    await writeLocalIndexFromGraph(graph, path.resolve(args.repo), args, sourceUrl);
   }
 
   // ── Neo4j indexing ─────────────────────────────────────────────────
@@ -453,10 +565,10 @@ async function main(): Promise<void> {
   }
 
   // ── Embeddings ─────────────────────────────────────────────────────
-  if (args.embed) {
-    if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
+  if (args.embed && args.neo4jUri) {
+    if (!args.neo4jUser || !args.neo4jPassword) {
       console.error(
-        "[codelens] --embed requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
+        "[codelens] --embed requires --neo4j-user and --neo4j-password with --neo4j-uri",
       );
       process.exit(2);
     }
@@ -493,9 +605,13 @@ async function runIncremental(
   args: CliArgs,
   sourceUrl: string | undefined,
 ): Promise<void> {
-  if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
+  if (!args.neo4jUri) {
+    await runIncrementalLocal(args, sourceUrl);
+    return;
+  }
+  if (!args.neo4jUser || !args.neo4jPassword) {
     console.error(
-      "[codelens] --incremental requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
+      "[codelens] --incremental with --neo4j-uri requires --neo4j-user and --neo4j-password",
     );
     process.exit(2);
   }
@@ -647,6 +763,13 @@ async function runIncremental(
       indexedAt,
     });
 
+    if (args.layers) {
+      // Only the re-extracted files are real nodes here; phantoms carry no
+      // evidence and were tagged on an earlier run.
+      const only = new Set([...toExtract].map((p) => `file:${p}`));
+      await runLayerTagging(graph, absRepo, args, only);
+    }
+
     if (args.stats) {
       const counts: Record<string, number> = {};
       for (const n of graph.nodes) counts[n.kind] = (counts[n.kind] ?? 0) + 1;
@@ -715,9 +838,30 @@ async function runIncremental(
 }
 
 async function runClusterOnly(args: CliArgs): Promise<void> {
-  if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
+  if (!args.neo4jUri) {
+    // Local: reload the stored graph, recompute metrics, write it back.
+    const repo = path.resolve(args.repo || ".");
+    const index = readLocalIndex(repo);
+    console.error("[codelens] recomputing communities over the local index ...");
+    const result = buildLocalIndex(index.graph, {
+      repoPath: repo,
+      indexedAt: index.meta.indexedAt,
+      lastCommit: index.meta.lastCommit,
+      sourceUrl: index.meta.sourceUrl,
+      minCommunitySize: args.clusterMinSize ?? index.meta.minCommunitySize,
+      spinePagerank: args.clusterSpinePagerank,
+      spineBoundary: args.clusterSpineBoundary,
+      embeddingModel: index.meta.embeddingModel,
+    });
     console.error(
-      "[codelens] --cluster-only requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
+      `[codelens] clusters: ${result.metrics.communityCount} found ` +
+        `(modularity ${result.metrics.modularity.toFixed(3)}), wrote ${result.dir}`,
+    );
+    return;
+  }
+  if (!args.neo4jUser || !args.neo4jPassword) {
+    console.error(
+      "[codelens] --cluster-only with --neo4j-uri requires --neo4j-user and --neo4j-password",
     );
     process.exit(2);
   }
@@ -740,25 +884,21 @@ async function runClusterOnly(args: CliArgs): Promise<void> {
 }
 
 async function runSearch(args: CliArgs): Promise<void> {
-  if (!args.neo4jUri || !args.neo4jUser || !args.neo4jPassword) {
-    console.error(
-      "[codelens] --search requires Neo4j credentials (--neo4j-uri / --neo4j-user / --neo4j-password)",
-    );
-    process.exit(2);
-  }
-  const driver = neo4j.driver(
-    args.neo4jUri,
-    neo4j.auth.basic(args.neo4jUser, args.neo4jPassword),
-  );
+  const store = await openStore({
+    neo4jUri: args.neo4jUri,
+    neo4jUser: args.neo4jUser,
+    neo4jPassword: args.neo4jPassword,
+    neo4jDatabase: args.neo4jDatabase,
+    repo: args.repo || ".",
+  });
   try {
     console.error(
       `[codelens] search "${args.searchQuery}" ` +
-        `(mode=${args.searchMode ?? "auto"}, limit=${args.searchLimit ?? 20})`,
+        `(mode=${args.searchMode ?? "auto"}, limit=${args.searchLimit ?? 20}, ${store.backend})`,
     );
-    const hits = await search(driver, args.searchQuery!, {
+    const hits = await store.search(args.searchQuery!, {
       mode: args.searchMode,
       limit: args.searchLimit,
-      database: args.neo4jDatabase,
     });
     if (hits.length === 0) {
       console.error("[codelens] no hits");
@@ -777,8 +917,86 @@ async function runSearch(args: CliArgs): Promise<void> {
       }
     }
   } finally {
-    await driver.close();
+    await store.close();
   }
+}
+
+/**
+ * `--incremental` for the local backend.
+ *
+ * Deliberately not a partial merge. A full analysis of a 540-file repo takes
+ * under three seconds, and stitching a partial graph into a stored one means
+ * re-running import, type and call resolution over the seam — a lot of
+ * machinery to save two seconds. So: skip when the indexed commit is HEAD
+ * and the tree is clean; otherwise rebuild. Community labels live in their
+ * own file and survive either way. Revisit if a monorepo makes this slow.
+ */
+async function runIncrementalLocal(args: CliArgs, sourceUrl: string | undefined): Promise<void> {
+  const absRepo = path.resolve(args.repo);
+  const useGit = isGitRepo(absRepo);
+  const headCommit = useGit ? gitHeadCommit(absRepo) : null;
+  if (localIndexExists(absRepo) && useGit && headCommit) {
+    const { meta } = readLocalIndex(absRepo);
+    if (meta.lastCommit === headCommit && gitWorkingTreeClean(absRepo)) {
+      console.error(
+        `[codelens] already up to date at ${headCommit.slice(0, 12)} (commit + clean tree)`,
+      );
+      return;
+    }
+  }
+  console.error(`[codelens] re-indexing ${absRepo} (local backend rebuilds in full) ...`);
+  await reportGrammarLoad(absRepo, args.ignore);
+  const graph = analyzeRepository(absRepo, {
+    ignore: args.ignore,
+    resolveCallsByName: !args.noResolveCalls,
+  });
+  if (args.layers) await runLayerTagging(graph, absRepo, args);
+  await writeLocalIndexFromGraph(graph, absRepo, args, sourceUrl);
+}
+
+/**
+ * The local counterpart of "push to Neo4j, then cluster, then embed": one
+ * step that computes metrics, optionally embeds, and writes `.codelens/`.
+ */
+async function writeLocalIndexFromGraph(
+  graph: CodeGraph,
+  repo: string,
+  args: CliArgs,
+  sourceUrl: string | null | undefined,
+): Promise<void> {
+  let embeddingModel: string | undefined;
+  if (args.embed) {
+    console.error("[codelens] computing embeddings ...");
+    const report = await computeLocalEmbeddings(graph, {
+      repoPath: repo,
+      model: args.embedModel,
+      batchSize: args.embedBatch,
+    });
+    embeddingModel = report.model;
+    console.error(
+      `[codelens] embedded ${report.embedded}/${report.totalCandidates} nodes ` +
+        `in ${(report.durationMs / 1000).toFixed(1)}s`,
+    );
+  }
+  const result = buildLocalIndex(graph, {
+    repoPath: repo,
+    indexedAt: new Date().toISOString(),
+    lastCommit: isGitRepo(repo) ? gitHeadCommit(repo) : null,
+    sourceUrl,
+    minCommunitySize: args.clusterMinSize,
+    spinePagerank: args.clusterSpinePagerank,
+    spineBoundary: args.clusterSpineBoundary,
+    embeddingModel,
+  });
+  const mb = (result.bytes / 1024 / 1024).toFixed(1);
+  console.error(
+    `[codelens] wrote ${result.dir} (${mb} MB${result.gzipped ? ", gzipped" : ""}) — ` +
+      `${result.metrics.communityCount} communities, modularity ${result.metrics.modularity.toFixed(3)}`,
+  );
+  if (!isLocalDirIgnored(repo)) {
+    console.error(`[codelens] tip: add \`${LOCAL_DIR}/\` to .gitignore`);
+  }
+  console.error(`[codelens] serve it with: codelens mcp --repo ${repo}`);
 }
 
 main().catch((err: unknown) => {

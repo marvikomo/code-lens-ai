@@ -25,13 +25,20 @@ import {
 } from "../analyser/analyser";
 import { indexToNeo4j } from "../indexers/neo4j";
 import { clusterInNeo4j } from "../clustering/neo4j-leiden";
-import { computeFileMetrics } from "../clustering/graph-metrics";
+import { computeFileMetrics, heuristicLabelFor } from "../clustering/graph-metrics";
+import { buildLocalIndex } from "../store/build";
+import { LocalStore } from "../store/local";
+import { Neo4jStore } from "../store/neo4j";
+import { openStore } from "../store";
+import { startMcpServer, registerTools } from "../mcp/server";
 import {
   installHooks,
   uninstallHooks,
   hooksStatus,
 } from "../cli-commands/hooks";
 import { LANGUAGE_CONFIGS } from "../extractor/configs";
+import { tagFileLayers } from "../ai/layers";
+import { createJudge } from "../ai/judge";
 
 const DOC = fs.readFileSync(
   path.join(__dirname, "..", "..", "ARCHITECTURE.md"),
@@ -54,9 +61,18 @@ describe("ARCHITECTURE.md", () => {
       indexToNeo4j,
       clusterInNeo4j,
       computeFileMetrics,
+      heuristicLabelFor,
+      buildLocalIndex,
+      LocalStore,
+      Neo4jStore,
+      openStore,
+      startMcpServer,
+      registerTools,
       installHooks,
       uninstallHooks,
       hooksStatus,
+      tagFileLayers,
+      createJudge,
     };
     for (const [name, value] of Object.entries(symbols)) {
       expect(value).toBeDefined();

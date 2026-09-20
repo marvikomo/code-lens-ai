@@ -167,7 +167,8 @@ export async function computeAndStoreEmbeddings(
   }
 }
 
-function buildEmbeddingText(
+/** Signature + a bounded slice of the body — what the model actually sees. Shared with the local backend. */
+export function buildEmbeddingText(
   c: { signature?: string; body: string },
   maxBodyChars: number,
 ): string {

@@ -1,7 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ToolContext } from "../server";
-import { readQuery, asNumber, textResult } from "../util";
+import { textResult } from "../util";
+import type { SymbolRow } from "../../store/types";
 
 const impactAnalysisSchema: Record<string, any> = {
   symbol: z.string().describe("Symbol name (function/method/class) to analyze."),
@@ -88,30 +89,13 @@ async function runImpactAnalysis(
   d: number,
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   // 1. Locate the target + its home community + its is_core flag.
-  const targetParams: Record<string, unknown> = { symbol };
-  let targetWhere = "(target:Function OR target:Method OR target:Class OR target:Variable)";
-  if (file) {
-    targetWhere += " AND target.path CONTAINS $file";
-    targetParams.file = file;
-  }
-  const targetRows = await readQuery(
-    ctx,
-    `MATCH (target:CodeNode { name: $symbol })
-     WHERE ${targetWhere}
-     OPTIONAL MATCH (target)<-[:DEFINES]-(targetFile:File)
-     OPTIONAL MATCH (targetFile)-[:IN_COMMUNITY]->(targetComm:Community)
-     RETURN target, targetFile, targetComm,
-            target.path AS targetPath,
-            target.startRow AS targetStartRow,
-            targetFile.is_core AS targetIsCore,
-            targetFile.pagerank AS targetPagerank,
-            targetFile.boundary AS targetBoundary,
-            targetComm.communityId AS targetCommId,
-            targetComm.label AS targetCommLabel
-     ORDER BY target.path, target.startRow
-     LIMIT ${AMBIGUITY_PROBE_LIMIT}`,
-    targetParams,
-  );
+  const targetRows = await ctx.store.findSymbols({
+    name: symbol,
+    kinds: ["Function", "Method", "Class", "Variable"],
+    pathContains: file,
+    limit: AMBIGUITY_PROBE_LIMIT,
+    withFileFacts: true,
+  });
   if (targetRows.length === 0) {
     return textResult(
       `No symbol named "${symbol}" found${file ? ` in files matching "${file}"` : ""}.`,
@@ -122,82 +106,46 @@ async function runImpactAnalysis(
   // resolver takes for ambiguous type references.
   if (targetRows.length > 1) {
     const options = targetRows
-      .map((r) => `  - ${String(r.targetPath ?? "?")}:${asNumber(r.targetStartRow) ?? 0}`)
+      .map((r) => `  - ${r.path ?? "?"}:${r.startRow}`)
       .join("\n");
     return textResult(
       `"${symbol}" is ambiguous — ${targetRows.length} declarations share that name:\n` +
         `${options}\n\n` +
         `Re-run with \`file\` set to a path substring that selects one, ` +
-        `e.g. file: "${String(targetRows[0].targetPath ?? "")}".`,
+        `e.g. file: "${targetRows[0].path ?? ""}".`,
     );
   }
-  const tr = targetRows[0];
-  const targetPath = String(tr.targetPath ?? "");
-  const target = tr.target as { properties: Record<string, unknown> };
-  const targetFile = tr.targetFile as { properties: Record<string, unknown> } | null;
-  const targetComm = tr.targetComm as { properties: Record<string, unknown> } | null;
-  const targetIsCore = !!tr.targetIsCore;
-  const targetCommId = asNumber(tr.targetCommId);
-  const targetCommLabel = tr.targetCommLabel as string | null;
-  const targetBoundary = asNumber(tr.targetBoundary) ?? 0;
+  const target = targetRows[0];
+  const targetPath = target.path ?? "";
+  const targetFile = target.file ?? null;
+  const targetIsCore = !!targetFile?.isCore;
+  const targetCommId = targetFile?.communityId;
+  const targetCommLabel = targetFile?.communityLabel ?? null;
+  const targetBoundary = targetFile?.boundary ?? 0;
 
-  // 2. Pull callers (direct + transitive) with caller-side context.
-  targetParams.targetPath = targetPath;
-  const callerRows = await readQuery(
-    ctx,
-    `MATCH (target:CodeNode { name: $symbol })
-     WHERE (target:Function OR target:Method OR target:Class OR target:Variable)
-       AND target.path = $targetPath
-     WITH target LIMIT 1
-     MATCH p=(caller)-[:${IMPACT_RELATIONS.join("|")}*1..${d}]->(target)
-     WITH caller,
-          collect({
-            distance: length(p),
-            sources: [rel IN relationships(p) | coalesce(rel.source, "name_only")],
-            rels: [rel IN relationships(p) | type(rel)]
-          }) AS paths
-     WITH caller,
-          reduce(minD = 999999, pathInfo IN paths |
-            CASE WHEN pathInfo.distance < minD THEN pathInfo.distance ELSE minD END
-          ) AS distance,
-          paths
-     WITH caller, distance,
-          [pathInfo IN paths WHERE pathInfo.distance = distance][0].sources AS sources,
-          [pathInfo IN paths WHERE pathInfo.distance = distance][0].rels AS rels
-     OPTIONAL MATCH (caller)<-[:DEFINES]-(callerFile:File)
-     OPTIONAL MATCH (callerFile)-[:IN_COMMUNITY]->(callerComm:Community)
-     RETURN caller.name AS name,
-            caller.path AS path,
-            caller.startRow AS startRow,
-            distance,
-            sources,
-            rels,
-            callerFile.is_core AS callerIsCore,
-            callerFile.pagerank AS callerPagerank,
-            callerFile.isTest AS callerIsTest,
-            callerComm.communityId AS callerCommId,
-            callerComm.label AS callerCommLabel`,
-    targetParams,
+  // 2. Everything that reaches the target within depth d, with the shortest
+  //    path's edge sources and relation kinds.
+  const callerRows = await ctx.store.impactCallers(
+    { name: symbol, path: targetPath },
+    d,
+    IMPACT_RELATIONS,
   );
 
-  const allCallers: CallerInfo[] = callerRows.map((r) => {
-    const rels = Array.isArray(r.rels) ? r.rels.map(String) : [];
-    return {
-    rels,
+  const allCallers: CallerInfo[] = callerRows.map((r) => ({
+    rels: r.rels,
     // Any inheritance hop makes this an inheritance relationship rather than
     // a call, and it is reported in its own section.
-    isSubtype: rels.some((t) => t === "EXTENDS" || t === "IMPLEMENTS"),
-    name: String(r.name ?? "(anonymous)"),
-    path: String(r.path ?? ""),
-    startRow: asNumber(r.startRow) ?? 0,
+    isSubtype: r.rels.some((t) => t === "EXTENDS" || t === "IMPLEMENTS"),
+    name: r.name,
+    path: r.path,
+    startRow: r.startRow,
     source: primarySource(r.sources),
-    isTest: !!r.callerIsTest,
-    isSpineCaller: !!r.callerIsCore,
-    callerPagerank: asNumber(r.callerPagerank) ?? 0,
-    callerCommunityId: asNumber(r.callerCommId),
-    callerCommunityLabel: (r.callerCommLabel as string | null) ?? undefined,
-    };
-  });
+    isTest: r.callerIsTest,
+    isSpineCaller: r.callerIsCore,
+    callerPagerank: r.callerPagerank,
+    callerCommunityId: r.callerCommunityId,
+    callerCommunityLabel: r.callerCommunityLabel ?? undefined,
+  }));
 
   // Subtypes are impact, but they are not callers — keeping them out of the
   // caller counts stops a class with many subclasses from reading as a
@@ -206,9 +154,7 @@ async function runImpactAnalysis(
 
   // distance==1 callers are direct; rest are transitive.
   const direct = callerRows
-    .map((r, i) =>
-      asNumber(r.distance) === 1 && !allCallers[i].isSubtype ? allCallers[i] : null,
-    )
+    .map((r, i) => (r.distance === 1 && !allCallers[i].isSubtype ? allCallers[i] : null))
     .filter((c): c is CallerInfo => c !== null);
   const transitive = allCallers.filter((c) => !c.isSubtype);
 
@@ -257,7 +203,6 @@ async function runImpactAnalysis(
     renderImpactAnalysis({
       target,
       targetFile,
-      targetComm,
       targetCommId,
       targetCommLabel,
       targetIsCore,
@@ -456,9 +401,8 @@ function truncateProdCallers(
 }
 
 interface RenderArgs {
-  target: { properties: Record<string, unknown> };
-  targetFile: { properties: Record<string, unknown> } | null;
-  targetComm: { properties: Record<string, unknown> } | null;
+  target: SymbolRow;
+  targetFile: SymbolRow["file"] | null;
   targetCommId: number | undefined;
   targetCommLabel: string | null;
   targetIsCore: boolean;
@@ -481,9 +425,9 @@ interface RenderArgs {
 
 function renderImpactAnalysis(a: RenderArgs): string {
   const out: string[] = [];
-  const targetName = a.target.properties.name;
-  const targetPath = a.targetFile?.properties.path ?? "(unknown file)";
-  const targetLine = (asNumber(a.target.properties.startRow) ?? 0) + 1;
+  const targetName = a.target.name;
+  const targetPath = a.targetFile?.path ?? "(unknown file)";
+  const targetLine = a.target.startRow + 1;
 
   out.push(`# Impact analysis: \`${targetName}\` (${targetPath}:${targetLine})`);
   out.push("");
@@ -496,10 +440,10 @@ function renderImpactAnalysis(a: RenderArgs): string {
   // File-level blast — broader signal than this symbol's caller set. Useful
   // when the verdict says "safe" but the containing file is a hub: even
   // unrelated edits to the file can ripple.
-  const blast = asNumber(a.targetFile?.properties.blastScore);
+  const blast = a.targetFile?.blastScore;
   if (blast !== undefined && blast > 0) {
-    const direct = asNumber(a.targetFile?.properties.blastDirect) ?? 0;
-    const transitive = asNumber(a.targetFile?.properties.blastTransitive) ?? 0;
+    const direct = a.targetFile?.blastDirect ?? 0;
+    const transitive = a.targetFile?.blastTransitive ?? 0;
     out.push(
       `**Containing file blast=${Math.round(blast)}** ` +
         `(${direct} direct importers, ${transitive} transitive) — ` +

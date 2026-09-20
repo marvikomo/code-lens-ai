@@ -179,6 +179,19 @@ function nodeToRow(n: GraphNode): Record<string, unknown> {
   if (n.builder) props.builder = n.builder;
   if (n.isTest) props.isTest = n.isTest;
   if (n.testFramework) props.testFramework = n.testFramework;
+  if (n.metrics) {
+    // Same property names `clusterInNeo4j` writes, so a graph clustered
+    // locally and then pushed reads identically.
+    props.community = n.metrics.community;
+    props.pagerank = n.metrics.pagerank;
+    props.boundary = n.metrics.boundary;
+    props.blastDirect = n.metrics.blastDirect;
+    props.blastTransitive = n.metrics.blastTransitive;
+    props.blastScore = n.metrics.blastScore;
+    props.is_core = n.metrics.isCore;
+  }
+  if (n.layer) props.layer = n.layer;
+  if (n.layerConfidence !== undefined) props.layerConfidence = n.layerConfidence;
   if (n.contentHash) props.contentHash = n.contentHash;
   if (n.lastIndexed) props.lastIndexed = n.lastIndexed;
   if (n.lastCommit) props.lastCommit = n.lastCommit;

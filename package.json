@@ -59,15 +59,17 @@
     "url": "https://github.com/marvikomo/code-lens-aI/issues"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@typesafe-ai/sdk": "^0.6.0",
     "@xenova/transformers": "^2.17.2",
     "dotenv": "^16.5.0",
     "graphlib": "^2.1.8",
     "graphology": "^0.26.0",
     "graphology-communities-louvain": "^2.0.2",
+    "minisearch": "^7.2.0",
     "neo4j-driver": "^5.28.1",
     "tree-sitter": "^0.25.0",
     "tree-sitter-java": "^0.23.5",

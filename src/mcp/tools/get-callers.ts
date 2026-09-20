@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ToolContext } from "../server";
-import { readQuery, asNumber, nodeKind, textResult, int } from "../util";
+import { textResult } from "../util";
 
 const getCallersSchema: Record<string, any> = {
   symbol: z
@@ -46,38 +46,20 @@ export function registerGetCallers(
       // `r` from `[r:CALLS*1..N]` is a List<Relationship>; use `size(r)` not
       // `length(r)` (length() is for Path values, hence the Neo4j type-mismatch
       // error this tool used to throw on depth=1).
-      const records = await readQuery(
-        ctx,
-        `MATCH (caller:CodeNode)-[r:CALLS*1..${d}]->(target)
-         WHERE target.name = $symbol OR target.symbol = $symbol
-         WITH caller, size(r) AS distance, target
-         RETURN DISTINCT caller, distance, target.name AS targetName, target.path AS targetPath
-         ORDER BY distance, caller.path
-         LIMIT $lim`,
-        { symbol, lim: int(lim) },
-      );
+      const rows = await ctx.store.callers(symbol, d, lim);
 
-      if (records.length === 0) {
+      if (rows.length === 0) {
         return textResult(`No callers found for "${symbol}" within depth ${d}.`);
       }
 
-      const lines = records.map((r) => {
-        const caller = r.caller as {
-          properties: Record<string, unknown>;
-          labels: string[];
-        };
-        const p = caller.properties;
-        const k = nodeKind(caller.labels);
-        const distance = asNumber(r.distance);
-        const startRow = asNumber(p.startRow) ?? 0;
-        return (
-          `- [d=${distance}] ${k} ${p.name}\n` +
-          `    ${p.path}:${startRow + 1}`
-        );
-      });
+      const lines = rows.map(
+        (r) =>
+          `- [d=${r.distance}] ${r.caller.kind} ${r.caller.name}\n` +
+          `    ${r.caller.path}:${(r.caller.startRow ?? 0) + 1}`,
+      );
 
       return textResult(
-        `${records.length} caller(s) of "${symbol}" (depth ≤ ${d}):\n\n` +
+        `${rows.length} caller(s) of "${symbol}" (depth ≤ ${d}):\n\n` +
           lines.join("\n"),
       );
     },

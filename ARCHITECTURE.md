@@ -26,10 +26,12 @@ with no services running.
 | **Extract** | `JsTsExtractor`, `JavaExtractor`, `GenericExtractor` — `extractor/` | CST → nodes and edges in a `GraphBuilder` |
 | **Analyse** | `analyzeRepository(repo, opts)` — `analyser/analyser.ts` | repo path → `CodeGraph` (walk, extract, resolve) |
 | **Analyse (incremental)** | `analyzeIncremental(repo, opts)` — `analyser/analyser.ts` | repo + changed-file set → partial `CodeGraph` |
-| **Index** | `indexToNeo4j(graph, opts)` — `indexers/neo4j.ts` | `CodeGraph` → nodes and edges in Neo4j |
-| **Cluster** | `clusterInNeo4j(opts)` — `clustering/neo4j-leiden.ts` | stored graph → community, pagerank, boundary, blast, spine |
-| **Metrics** | `computeFileMetrics(files, edges, opts)` — `clustering/graph-metrics.ts` | file-import graph → `MetricsResult` |
-| **Serve** | `mcp/server.ts` + `mcp/tools/` | agent request → Cypher / FTS / vector query → shaped answer |
+| **Tag layers** (optional) | `tagFileLayers(graph, judge, opts)`, `createJudge()` — `ai/layers.ts`, `ai/judge.ts` | `CodeGraph` → `File.layer` / `File.layerConfidence`, via TypeSafe |
+| **Metrics** | `computeFileMetrics(files, edges, opts)`, `heuristicLabelFor(paths)` — `clustering/graph-metrics.ts` | file-import graph → `MetricsResult`; member paths → fallback label |
+| **Store (local)** | `buildLocalIndex(graph, opts)` — `store/build.ts`; `LocalStore` — `store/local.ts` | `CodeGraph` → `<repo>/.codelens/`; served from memory |
+| **Store (Neo4j)** | `indexToNeo4j(graph, opts)` — `indexers/neo4j.ts`; `clusterInNeo4j(opts)` — `clustering/neo4j-leiden.ts`; `Neo4jStore` — `store/neo4j.ts` | `CodeGraph` → Neo4j; metrics written back; served by Cypher |
+| **Store (select)** | `openStore(opts)` — `store/index.ts` | flags/env → `GraphStore` |
+| **Serve** | `startMcpServer(store)`, `registerTools(server, store)` — `mcp/server.ts` + `mcp/tools/` | agent request → `GraphStore` method → shaped answer |
 | **Freshness** | `installHooks`, `uninstallHooks`, `hooksStatus` — `cli-commands/hooks.ts` | repo → git hooks that re-run the incremental path |
 
 ## Extraction: two paths
@@ -99,13 +101,60 @@ RNG — plus renumbering communities by their lowest member id.
 A file is spine (`is_core`) if it is top-K by PageRank or top-M by boundary
 degree within its community.
 
+## Semantic layers (optional)
+
+Communities are structural — files grouped by who imports whom. They cannot
+answer "where is the persistence layer?", because that is a question about
+what a file *is*, not who it talks to. `--layers` adds that second axis.
+
+`tagFileLayers` (`ai/layers.ts`) asks TypeSafe's Jev model — a System One
+model that returns a probability distribution over options you supply rather
+than generated text — one Choice question per file: which of a fixed
+vocabulary (`LAYERS`: `api_surface`, `ui`, `business_logic`, `data_access`,
+`infrastructure`, `configuration`, `utilities`, `tests`, `unclear`) the file
+belongs to. The evidence is what the graph already holds: relative path,
+language, third-party imports (the unresolved `IMPORTS` edges), imported repo
+files, declarations, HTTP routes, and the first lines of source.
+
+Division of labour is deliberate. Code owns the vocabulary, the evidence, the
+batching (a few files per request, greedy by size — small batches measurably
+sharpen the picks) and the thresholds; the
+model only picks. Both the pick and its confidence are stored, so
+`get_overview`'s low-confidence cut-off is display policy and can change
+without re-running inference. `createJudge` (`ai/judge.ts`) is the single
+seam to the SDK, and returns null without `TYPESAFE_API_KEY`; tests inject a
+fake `Judge`.
+
 ## Storage and serving
 
-The graph is built in memory (`util/graph.ts`, wrapping `graphlib`) and pushed
-to Neo4j, which provides the query engine, full-text index and vector index.
-The MCP server exposes ten tools that translate agent intent into queries and
-shape the results — decision-support prose (`impact_analysis`), structural
-facts (`generate_wiki`), or raw rows (`cypher`).
+The graph is built in memory (`util/graph.ts`, wrapping `graphlib`). Where it
+goes next is behind one interface, `GraphStore` (`store/types.ts`): one method
+per question the MCP tools ask — `communities()`, `impactCallers()`,
+`glossary()`, `search()` and so on — returning plain typed rows. Tools render
+prose from those rows and never see a driver or a query string.
+
+Two backends implement it:
+
+- **`LocalStore`** (`store/local.ts`) — the default. `codelens index` computes
+  file metrics in process, stamps them on the File nodes, and writes
+  `<repo>/.codelens/` (`graph.json`, `meta.json`, `labels.json`, optional
+  `embeddings.bin`). The server loads that into memory and answers every
+  query as a filter or bounded traversal over a few indexes. Keyword search is
+  `minisearch`; semantic search is a cosine scan over the stored vectors.
+  Community labels live in their own file and survive re-indexing.
+- **`Neo4jStore`** (`store/neo4j.ts`) — opt-in with `--neo4j-uri`. The
+  original Cypher, moved verbatim, so behaviour is unchanged. It is the only
+  backend that offers the free-form `cypher` tool, and the one to choose when
+  the graph should outlive the machine that built it.
+
+`openStore` (`store/index.ts`) picks: Neo4j when a URI is given, local
+otherwise. Both run the same `computeFileMetrics` and the same
+`heuristicLabelFor`, so communities and their fallback names agree.
+
+The store seam is also what made the tools testable: `mcp-tools.test.ts`
+drives a real `McpServer` over an in-memory transport against a `LocalStore`
+built from a fixture repo, and `store-contract.test.ts` pins what each store
+method returns.
 
 ## Known boundaries
 

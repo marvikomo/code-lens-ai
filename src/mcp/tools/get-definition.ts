@@ -1,7 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ToolContext } from "../server";
-import { readQuery, asNumber, nodeKind, textResult } from "../util";
+import { textResult } from "../util";
+import type { NodeKind } from "../../util/graph";
 
 const getDefinitionSchema: Record<string, any> = {
   name: z.string().describe("Exact symbol name (function/class/method/etc)."),
@@ -39,25 +40,14 @@ export function registerGetDefinition(
       inputSchema: getDefinitionSchema,
     },
     async ({ name, file, kind }) => {
-      const where: string[] = ["n.name = $name"];
-      const params: Record<string, unknown> = { name };
-      if (file) {
-        where.push("n.path CONTAINS $file");
-        params.file = file;
-      }
-      if (kind) where.push(`n:\`${kind}\``);
+      const rows = await ctx.store.findSymbols({
+        name,
+        pathContains: file,
+        kinds: kind ? [kind as NodeKind] : undefined,
+        limit: 20,
+      });
 
-      const records = await readQuery(
-        ctx,
-        `MATCH (n:CodeNode)
-         WHERE ${where.join(" AND ")}
-         RETURN n
-         ORDER BY n.path, n.startRow
-         LIMIT 20`,
-        params,
-      );
-
-      if (records.length === 0) {
+      if (rows.length === 0) {
         return textResult(
           `No definition found for "${name}"` +
             (file ? ` in files matching "${file}"` : "") +
@@ -65,17 +55,9 @@ export function registerGetDefinition(
         );
       }
 
-      const blocks = records.map((r, i) => {
-        const node = r.n as {
-          properties: Record<string, unknown>;
-          labels: string[];
-        };
-        const p = node.properties;
-        const k = nodeKind(node.labels);
-        const startRow = asNumber(p.startRow) ?? 0;
-        const endRow = asNumber(p.endRow) ?? 0;
+      const blocks = rows.map((p, i) => {
         const truncated = p.bodyTruncated ? " (truncated)" : "";
-        const header = `## ${i + 1}. ${k} \`${p.name}\` — ${p.path}:${startRow + 1}-${endRow + 1}${truncated}`;
+        const header = `## ${i + 1}. ${p.kind} \`${p.name}\` — ${p.path}:${p.startRow + 1}-${p.endRow + 1}${truncated}`;
         const sig = p.signature
           ? `\n\nSignature:\n\`\`\`${p.language ?? ""}\n${p.signature}\n\`\`\``
           : "";
@@ -86,7 +68,7 @@ export function registerGetDefinition(
       });
 
       return textResult(
-        `Found ${records.length} definition(s) of "${name}":\n\n` +
+        `Found ${rows.length} definition(s) of "${name}":\n\n` +
           blocks.join("\n\n---\n\n"),
       );
     },

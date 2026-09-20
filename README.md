@@ -2,7 +2,7 @@
 
 **A code-intelligence MCP server for AI agents.** Index a codebase once, then ask Claude / Cursor / any MCP client to understand it — with answers grounded in the real call graph, real architectural subsystems, and real source code, not hallucinated guesses.
 
-Built on Tree-sitter + Neo4j + Leiden community detection. **24 languages**, with JS / TS / TSX / Java parsed out of the box.
+Built on Tree-sitter + community detection, served over MCP with no database required (Neo4j optional). **24 languages**, with JS / TS / TSX / Java parsed out of the box.
 
 > **From a real session on a ~2,000-file TypeScript monorepo (73 detected subsystems):**
 > *"This is exactly the right tool — it collapses what would be a long exploration into a handful of focused calls, and the community detection produces architectural insight you'd struggle to get from grep."*
@@ -85,17 +85,17 @@ Source code
 Graph extraction (functions, classes, calls, imports, routes,
                   state objects, anonymous handlers, test files)
     │
-    ▼ stored in
-    │
-Neo4j (with FTS index + vector index for hybrid search)
-    │
-    ▼ Leiden clustering
+    ▼ community detection (in process)
     │
 Communities + PageRank + boundary degree → spine files
     │
+    ▼ stored in
+    │
+<repo>/.codelens/  (default)   —or—   Neo4j  (--neo4j-uri; adds the cypher tool)
+    │
     ▼ exposed via
     │
-MCP server (10 tools, stdio transport)
+MCP server (9 tools, +cypher on Neo4j; stdio transport)
     │
     ▼
 Claude Code, Cursor, Codex, any MCP client
@@ -205,8 +205,9 @@ delivered.
 
 ### Prerequisites
 
-- Node.js 18+
-- Docker (for the bundled Neo4j container)
+- Node.js 20+
+
+No database, no Docker. The graph lives in `<repo>/.codelens/`.
 
 ### Install + index + wire up
 
@@ -214,23 +215,20 @@ delivered.
 # Install the CLI globally
 npm install -g @marvikomo/codelens-ai
 
-# Start the bundled Neo4j (image: neo4j:5.15 with the APOC plugin)
-codelens neo4j start
+# Index a repo: parses, resolves calls, detects communities, writes .codelens/
+codelens index /path/to/your/repo
 
-# Index a repo + run Leiden clustering
-codelens index /path/to/your/repo \
-  --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password password \
-  --neo4j-clear --cluster
-
-# (Optional) semantic + hybrid search (downloads ~161 MB embedding model)
-codelens index /path/to/your/repo \
-  --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password password \
-  --embed
+# (Optional) semantic + hybrid search (downloads ~161 MB embedding model once)
+codelens index /path/to/your/repo --embed
 
 # Register the MCP server with Claude Code (one-time)
-codelens mcp install --scope user \
-  --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password password
+codelens mcp install --scope user --repo /path/to/your/repo
+
+# Keep it fresh: re-index after every commit, checkout, merge and rebase
+codelens hooks install /path/to/your/repo
 ```
+
+Add `.codelens/` to the repo's `.gitignore`.
 
 Then in any Claude Code session:
 
@@ -238,15 +236,32 @@ Then in any Claude Code session:
 Use codelens to give me an overview of this codebase.
 ```
 
-The agent will see 10 tools (`search_code`, `get_definition`, `read_code`, `get_callers`, `get_callees`, `impact_analysis`, `get_overview`, `label_community`, `generate_wiki`, `cypher`) and decide which to use.
+The agent will see 9 tools (`search_code`, `get_definition`, `read_code`, `get_callers`, `get_callees`, `impact_analysis`, `get_overview`, `label_community`, `generate_wiki`) and decide which to use.
+
+### Optional: Neo4j backend
+
+Pass `--neo4j-uri` (or set `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD`) and the same
+commands store the graph in Neo4j instead. You get one extra tool, `cypher`, for
+free-form read-only queries, and a graph that outlives the machine that built it.
+
+```bash
+codelens neo4j start                                   # bundled neo4j:5.15 via Docker
+codelens index /path/to/your/repo \
+  --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password password \
+  --neo4j-clear --cluster
+codelens mcp install --scope user \
+  --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password password
+```
+
+Every tool produces the same answer on either backend. If `NEO4J_URI` is set in
+your shell but you want the local index, pass `--local`.
 
 ### Day-to-day
 
 ```bash
-codelens index /path/to/repo --incremental    # only re-index changed files
-codelens neo4j status                          # is the DB up?
-codelens neo4j logs                            # tail container logs
-codelens neo4j stop                            # shut down (data persists in docker volume)
+codelens index /path/to/repo --incremental    # skip if nothing changed (local: rebuilds otherwise, ~seconds)
+codelens mcp --repo /path/to/repo             # start the server by hand
+codelens neo4j status|logs|stop               # only if you use the Neo4j backend
 ```
 
 ### Development (from source)
@@ -341,6 +356,13 @@ codelens help                                   # show top-level help
 --embed                # compute embeddings for Function/Method/Class nodes
 --embed-model <hf-id>  # override default jinaai/jina-embeddings-v2-base-code
 
+# Semantic layers (opt-in; needs TYPESAFE_API_KEY — https://typesafe.ai)
+--layers               # tag every File with an architectural layer via TypeSafe's Jev:
+                       # api_surface | ui | business_logic | data_access | infrastructure
+                       # | configuration | utilities | tests | unclear
+--layers-model <id>    # override default jev-latest
+--layers-min-confidence <0-1>  # report picks below this as low-confidence (default 0.6)
+
 # Search-only mode (no <repo-path> needed)
 --search "<query>"
 --search-mode <m>      # fts | vector | hybrid (auto if omitted)
@@ -380,6 +402,7 @@ Every indexed codebase gets:
 - Tests: `isTest`, `testFramework` (jest / vitest / bun / junit / pytest detection)
 - Communities: `community` int, `pagerank` float, `boundary` int, `is_core` boolean
 - Embeddings: `embedding` float[768] (when `--embed` was run)
+- Semantic layers: `layer` string, `layerConfidence` float (when `--layers` was run) — a second axis to communities: `MATCH (f:File {layer: 'data_access'}) RETURN f.path`
 - FTS: indexed on `name`, `signature`, `body`, `path`
 
 **What gets uniquely captured that other indexers miss:**
@@ -393,7 +416,7 @@ Every indexed codebase gets:
 
 ## 🏗️ Architecture (one paragraph)
 
-The CLI walks a repo, parses each file with **Tree-sitter** (24 languages), runs language-specific extractors that emit nodes (functions, classes, etc.) and edges (calls, imports) into an in-memory `graphlib` graph. The graph is bulk-pushed to **Neo4j** with a uniqueness constraint on `:CodeNode(id)`. After indexing, community detection (Louvain), PageRank, boundary degree and blast radius run **in process** over the file-IMPORTS subgraph — a few thousand nodes even on a large monorepo — and per-community spine selection writes `is_core: true` on the most-central files. No Neo4j GDS plugin is required. Optionally, **`@xenova/transformers`** computes 768-dim vector embeddings for Function/Method/Class bodies (jina-base-code model, in-process, ~161 MB). At query time, the **MCP server** exposes 10 tools that translate agent intent into Cypher / FTS / vector queries against this graph and shape the results into either decision-support prose (impact_analysis), structural facts (generate_wiki), or raw data (cypher).
+The CLI walks a repo, parses each file with **Tree-sitter** (24 languages), runs language-specific extractors that emit nodes (functions, classes, etc.) and edges (calls, imports) into an in-memory `graphlib` graph. Community detection (Louvain), PageRank, boundary degree and blast radius run **in process** over the file-IMPORTS subgraph — a few thousand nodes even on a large monorepo — and per-community spine selection marks the most-central files `is_core`. The result is written to `<repo>/.codelens/` by default, or pushed to **Neo4j** when `--neo4j-uri` is given. Optionally, **`@xenova/transformers`** computes 768-dim vector embeddings for Function/Method/Class bodies (jina-base-code model, in-process, ~161 MB). At query time, the **MCP server** loads whichever store you built and exposes its tools through one `GraphStore` interface, shaping results into decision-support prose (impact_analysis), structural facts (generate_wiki), or — Neo4j only — raw rows (cypher).
 
 ---
 
@@ -404,6 +427,7 @@ src/
 ├── analyser/         # repo-walking + per-file extraction orchestration
 ├── extractor/        # per-language tree-sitter walkers (jsts.ts, java.ts, base.ts)
 ├── util/             # graph data model, language detection, parser factory
+├── store/            # GraphStore interface; local (.codelens/) and Neo4j backends
 ├── indexers/         # Neo4j bulk-write
 ├── clustering/       # In-process Louvain + PageRank + blast + spine
 ├── embeddings/       # @xenova/transformers wrapper + batch pipeline

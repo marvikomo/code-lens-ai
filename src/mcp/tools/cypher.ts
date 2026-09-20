@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ToolContext } from "../server";
-import { readQuery, unwrap, textResult } from "../util";
+import { textResult } from "../util";
 
 // Reject anything that looks like mutation. Crude but adequate for a
 // read-only escape hatch — allows MATCH/RETURN/WITH/CALL but rejects writes.
@@ -60,21 +60,20 @@ export function registerCypher(server: McpServer, ctx: ToolContext): void {
             "This tool is read-only.",
         );
       }
-      let records;
+      let records: Record<string, unknown>[];
       try {
-        records = await readQuery(ctx, query);
+        records = await ctx.store.cypher(query);
       } catch (err) {
         return textResult(`Cypher error: ${(err as Error).message}`);
       }
       const lim = limit ?? 50;
       const truncated = records.length > lim;
       const slice = truncated ? records.slice(0, lim) : records;
-      const cleaned = slice.map(unwrap);
       const header = truncated
         ? `Returned ${slice.length} of ${records.length} records (truncated to ${lim}):\n\n`
         : `Returned ${slice.length} record(s):\n\n`;
       return textResult(
-        header + "```json\n" + JSON.stringify(cleaned, null, 2) + "\n```",
+        header + "```json\n" + JSON.stringify(slice, null, 2) + "\n```",
       );
     },
   );

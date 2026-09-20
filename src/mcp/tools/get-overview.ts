@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolContext } from "../server";
-import { readQuery, asNumber, textResult } from "../util";
+import { textResult } from "../util";
 
 /**
  * Compact wall-clock age for an ISO timestamp ("3h ago", "2d ago", "5w ago").
@@ -196,8 +196,9 @@ export function registerGetOverview(
       title: "High-level codebase overview",
       description:
         "Return a fast structural summary: total counts by node kind, language distribution, " +
-        "top architectural communities (subsystems detected via Leiden), and the spine files " +
-        "in each community (most central, by PageRank+boundary). " +
+        "top architectural communities (subsystems detected via Leiden), the spine files " +
+        "in each community (most central, by PageRank+boundary), and — when the index was " +
+        "built with --layers — a per-layer file count (api_surface, data_access, tests, ...). " +
         "Use this as the FIRST tool when starting work on an unfamiliar codebase to orient yourself. " +
         "If communities are unlabeled, the response ends with an ACTION REQUIRED block — " +
         "follow it by calling label_community for each unlabeled community to give them " +
@@ -205,95 +206,33 @@ export function registerGetOverview(
       inputSchema: {},
     },
     async () => {
-      const [counts, languages, communities, repoRows, topBlast] = await Promise.all([
-        readQuery(
-          ctx,
-          `MATCH (n:CodeNode)
-           WITH labels(n) AS labels, n
-           UNWIND labels AS l
-           WITH l, count(*) AS c WHERE l <> 'CodeNode'
-           RETURN l AS kind, c AS count ORDER BY count DESC`,
-        ),
-        readQuery(
-          ctx,
-          `MATCH (f:File) WHERE f.language IS NOT NULL
-           RETURN f.language AS language, count(*) AS count ORDER BY count DESC`,
-        ),
-        readQuery(
-          ctx,
-          // Fetch heuristicLabel for fallback chain, plus full paths so we
-          // can render relative-to-repo (basenames alone collide across
-          // communities). Also fetch description timestamp + spine snapshot
-          // + CURRENT spine paths AND content hashes — for the hash-based
-          // staleness detector that distinguishes "spine drifted" (path
-          // changes) from "spine content drifted" (file rewritten in place).
-          // spineBlasts is a parallel array to spinePaths, indexed identically;
-          // null for files that pre-date the blast-radius pass.
-          `MATCH (c:Community)<-[:IN_COMMUNITY]-(f:File)
-           OPTIONAL MATCH (c)<-[:IN_COMMUNITY]-(spine:File {is_core: true})
-           WITH c, count(DISTINCT f) AS size,
-                collect(DISTINCT { path: spine.path, hash: spine.contentHash, blast: spine.blastScore }) AS spineInfo,
-                collect(DISTINCT f.path)[..3] AS samplePaths
-           WITH c, size, samplePaths,
-                [x IN spineInfo WHERE x.path IS NOT NULL | x.path][..6] AS spinePaths,
-                [x IN spineInfo WHERE x.path IS NOT NULL | x.blast][..6] AS spineBlasts,
-                [x IN spineInfo WHERE x.path IS NOT NULL | x.path] AS allCurrentSpinePaths,
-                [x IN spineInfo WHERE x.path IS NOT NULL | coalesce(x.hash, '')] AS allCurrentSpineHashes
-           RETURN c.communityId AS id,
-                  c.label AS label,
-                  c.heuristicLabel AS heuristicLabel,
-                  c.description AS description,
-                  c.descriptionWrittenAt AS descriptionWrittenAt,
-                  c.descriptionSpineSnapshot AS descriptionSpineSnapshot,
-                  c.descriptionSpineHashes AS descriptionSpineHashes,
-                  size, spinePaths, spineBlasts, samplePaths,
-                  allCurrentSpinePaths, allCurrentSpineHashes
-           ORDER BY size DESC LIMIT 12`,
-        ),
-        readQuery(
-          ctx,
-          `MATCH (r:Repository)
-           RETURN r.path AS path, r.lastIndexed AS lastIndexed,
-                  r.lastCommit AS lastCommit
-           LIMIT 1`,
-        ),
+      const store = ctx.store;
+      const [counts, languages, communities, repoMeta, topBlast, layers] = await Promise.all([
+        store.countsByKind(),
+        store.languageCounts(),
+        store.communities({ limit: 12 }),
+        store.repositoryMeta(),
         // Top-10 by blast — files whose change ripples widest. Distinct from
         // spine (which is centrality WITHIN a community); high-blast files
         // are damage potential ACROSS the whole graph. Often overlapping but
         // the non-overlaps are interesting: a high-blast non-spine file is
         // "boring utility everyone imports."
-        readQuery(
-          ctx,
-          `MATCH (f:File)
-           WHERE f.blastScore IS NOT NULL AND f.blastScore > 0
-           OPTIONAL MATCH (f)-[:IN_COMMUNITY]->(c:Community)
-           RETURN f.path AS path,
-                  f.blastScore AS blast,
-                  f.blastDirect AS direct,
-                  f.blastTransitive AS transitive,
-                  f.is_core AS isSpine,
-                  coalesce(c.label, c.heuristicLabel,
-                           CASE WHEN c.communityId IS NOT NULL
-                                THEN 'community-' + toString(c.communityId)
-                                ELSE '(no community)' END) AS community
-           ORDER BY f.blastScore DESC
-           LIMIT 10`,
-        ),
+        store.topBlastFiles(10),
+        // Semantic layers written by `codelens index --layers`. Empty when
+        // the repo was indexed without it; the section is then omitted.
+        store.layerCounts(),
       ]);
 
       // Repo prefix used to render relative paths. Falls back to "" so
       // absolute paths render as-is on cold/missing Repository nodes.
-      const repoPath: string =
-        (repoRows[0]?.path as string | undefined) ?? "";
+      const repoPath: string = repoMeta?.path ?? "";
       const rel = (p: string): string =>
         repoPath && p.startsWith(repoPath)
           ? p.slice(repoPath.length).replace(/^\/+/, "")
           : p;
 
-      const lastIndexedIso =
-        (repoRows[0]?.lastIndexed as string | undefined) ?? null;
-      const lastCommit =
-        (repoRows[0]?.lastCommit as string | undefined) ?? null;
+      const lastIndexedIso = repoMeta?.lastIndexed ?? null;
+      const lastCommit = repoMeta?.lastCommit ?? null;
       const indexAge = describeAge(lastIndexedIso);
 
       const out: string[] = [];
@@ -310,14 +249,33 @@ export function registerGetOverview(
       out.push("");
       out.push("## Node counts");
       for (const r of counts) {
-        out.push(`- ${r.kind}: ${asNumber(r.count)}`);
+        out.push(`- ${r.kind}: ${r.count}`);
       }
       out.push("");
       out.push("## Language distribution (files)");
       for (const r of languages) {
-        out.push(`- ${r.language}: ${asNumber(r.count)}`);
+        out.push(`- ${r.language}: ${r.count}`);
       }
       out.push("");
+      if (layers.length > 0) {
+        out.push("## Semantic layers (files)");
+        out.push("");
+        out.push(
+          "> Each file was assigned one architectural layer by a System One model " +
+            "at index time (`--layers`). Orthogonal to communities: a community says " +
+            "which files change together, a layer says what a file is for. Query with " +
+            "`MATCH (f:File {layer: 'data_access'}) RETURN f.path`. Low-confidence " +
+            "picks (< 0.6) are counted separately — treat those as hints.",
+        );
+        out.push("");
+        for (const r of layers) {
+          out.push(
+            `- ${r.layer}: ${r.count}` +
+              (r.lowConfidence > 0 ? ` (${r.lowConfidence} low-confidence)` : ""),
+          );
+        }
+        out.push("");
+      }
       if (topBlast.length > 0) {
         out.push("## High-blast files (top 10 — changes ripple widely)");
         out.push("");
@@ -329,16 +287,10 @@ export function registerGetOverview(
         );
         out.push("");
         for (const b of topBlast) {
-          const path = rel((b.path as string) ?? "");
-          const blast = asNumber(b.blast) ?? 0;
-          const direct = asNumber(b.direct) ?? 0;
-          const transitive = asNumber(b.transitive) ?? 0;
-          const community = (b.community as string | null) ?? "(no community)";
-          const isSpine = Boolean(b.isSpine);
-          const spineMark = isSpine ? " ★ spine" : "";
+          const spineMark = b.isSpine ? " ★ spine" : "";
           out.push(
-            `- ${path}  blast=${Math.round(blast)}  ` +
-              `(${direct} direct, ${transitive} transitive) · ${community}${spineMark}`,
+            `- ${rel(b.path)}  blast=${Math.round(b.blast)}  ` +
+              `(${b.direct} direct, ${b.transitive} transitive) · ${b.community}${spineMark}`,
           );
         }
         out.push("");
@@ -382,34 +334,29 @@ export function registerGetOverview(
           sample: string[];
         }> = [];
 
-        const stringArr = (v: unknown): string[] =>
-          Array.isArray(v) ? (v as unknown[]).map(String) : [];
+        for (const c of communities) {
+          const id = c.id;
+          const size = c.size;
+          const labelRaw = c.label;
+          const heuristicLabel = c.heuristicLabel;
+          const descriptionRaw = c.description;
+          const descriptionWrittenAt = c.descriptionWrittenAt;
 
-        for (const r of communities) {
-          const id = asNumber(r.id) ?? 0;
-          const size = asNumber(r.size);
-          const labelRaw = (r.label as string | null) ?? null;
-          const heuristicLabel =
-            (r.heuristicLabel as string | null) ?? null;
-          const descriptionRaw = (r.description as string | null) ?? null;
-          const descriptionWrittenAt =
-            (r.descriptionWrittenAt as string | null) ?? null;
+          const snapshotPaths = c.descriptionSpineSnapshot;
+          const snapshotHashes = c.descriptionSpineHashes;
+          const currentSpinePathsAll = c.spine.map((s) => s.path);
+          const currentSpineHashesAll = c.spine.map((s) => s.hash);
 
-          const snapshotPaths = stringArr(r.descriptionSpineSnapshot);
-          const snapshotHashes = stringArr(r.descriptionSpineHashes);
-          const currentSpinePathsAll = stringArr(r.allCurrentSpinePaths);
-          const currentSpineHashesAll = stringArr(r.allCurrentSpineHashes);
-
-          const spinePathsRaw = ((r.spinePaths as string[]) ?? []).map(rel);
-          const spineBlastsRaw = (r.spineBlasts as unknown[]) ?? [];
           // Zip spine paths with blast for inline rendering. Skip blast on
           // files where it's missing or zero — keeps the line uncluttered for
-          // isolated files where the score adds no signal.
-          const spinePaths = spinePathsRaw.map((p, i) => {
-            const b = asNumber(spineBlastsRaw[i]) ?? 0;
+          // isolated files where the score adds no signal. Six is enough to
+          // orient; the full list feeds the freshness check above.
+          const spinePaths = c.spine.slice(0, 6).map((s) => {
+            const p = rel(s.path);
+            const b = s.blast ?? 0;
             return b > 0 ? `${p} (blast=${Math.round(b)})` : p;
           });
-          const samplePaths = ((r.samplePaths as string[]) ?? []).map(rel);
+          const samplePaths = c.samplePaths.map(rel);
 
           // Compute freshness first — if invalidated, we suppress the label
           // for rendering and route the community to the staleAutoInvalidated

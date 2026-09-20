@@ -1,5 +1,6 @@
 import { Graph } from "graphlib";
 import type { SupportedLanguage } from "./language";
+import type { FileMetrics } from "../clustering/graph-metrics";
 
 /**
  * Graph schema
@@ -98,6 +99,16 @@ export interface GraphNode {
   isTest?: boolean;
   /** Test framework detected (jest / vitest / bun / junit / pytest / etc). */
   testFramework?: string;
+  /**
+   * File-only: community, PageRank, boundary, blast and spine flag from
+   * `computeFileMetrics`. Set by the local pipeline; the Neo4j pipeline
+   * computes the same numbers in `clusterInNeo4j` and writes them directly.
+   */
+  metrics?: FileMetrics;
+  /** File-only: architectural layer picked by the System One model (see `ai/layers.ts`). */
+  layer?: string;
+  /** File-only: the model's confidence in `layer`, 0–1. */
+  layerConfidence?: number;
   /** sha256 hex of the File's source content. Used by hash-mode incremental indexing. */
   contentHash?: string;
   /** ISO timestamp of when this node was last written to Neo4j. */
